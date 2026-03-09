@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "copy": "cp -R Waymark-JS/dist/ public/assets/waymark-js/",
-    "dev": "npm run copy && vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "dev": "npm run copy && ./bin/ogis-node ./node_modules/vite/bin/vite.js",
+    "build": "./bin/ogis-node ./node_modules/vite/bin/vite.js build",
+    "preview": "./bin/ogis-node ./node_modules/vite/bin/vite.js preview"
   },
   "dependencies": {
     "leaflet": "^1.9.4",

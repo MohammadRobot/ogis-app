@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+version_major() {
+  "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0
+}
+
+pick_node() {
+  if [ -n "${OGIS_NODE_BIN:-}" ] && [ -x "${OGIS_NODE_BIN}" ]; then
+    echo "${OGIS_NODE_BIN}"
+    return 0
+  fi
+
+  for candidate in \
+    "$HOME/.local/node-v22.14.0/bin/node" \
+    /usr/local/bin/node \
+    /usr/bin/node \
+    /bin/node
+  do
+    if [ -x "$candidate" ] && [ "$(version_major "$candidate")" -ge 20 ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  cat >&2 <<'EOF'
+OGIS requires Node.js 20 or newer.
+
+Set OGIS_NODE_BIN to a compatible node binary or install one at:
+  $HOME/.local/node-v22.14.0/bin/node
+EOF
+  exit 1
+}
+
+NODE_BIN="$(pick_node)"
+exec "$NODE_BIN" "$@"

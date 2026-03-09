@@ -1,9 +1,10 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import InspectionMap from "@/components/InspectionMap.vue";
 
 const API_BASE = String(import.meta.env.VITE_API_BASE || "/api").replace(/\/$/, "");
 const LOCAL_TOKEN_KEY = "ogis.local.access_token";
+const MOBILE_BREAKPOINT = 980;
 
 const seededProfiles = [
   { username: "inspector1", password: "local-seed", role: "Inspector" },
@@ -97,6 +98,7 @@ const selectedInspection = ref(null);
 const activeTab = ref("overview");
 const leftPanelOpen = ref(false);
 const rightPanelOpen = ref(false);
+const isMobileViewport = ref(false);
 const leftRailTab = ref("list");
 const createPlacementActive = ref(false);
 const createPlacementKind = ref("point");
@@ -332,6 +334,11 @@ function hasUserPasswordDraft(userId) {
 function clearMessages() {
   notice.value = "";
   errorMessage.value = "";
+}
+
+function syncViewportState() {
+  if (typeof window === "undefined") return;
+  isMobileViewport.value = window.innerWidth <= MOBILE_BREAKPOINT;
 }
 
 function setNotice(message) {
@@ -1060,6 +1067,10 @@ async function refreshDashboard() {
   clearMessages();
   try {
     await Promise.all([loadSummary(), loadInspections(true), loadInspectionMapData(), loadDirectory()]);
+    if (isMobileViewport.value && selectedInspectionId.value == null) {
+      leftPanelOpen.value = true;
+      rightPanelOpen.value = false;
+    }
   } catch (error) {
     setError(formatApiError(error, "Could not load dashboard"));
   } finally {
@@ -1573,11 +1584,20 @@ async function openInspectionFromList(inspectionId) {
 }
 
 function toggleLeftPanel() {
-  leftPanelOpen.value = !leftPanelOpen.value;
+  const nextState = !leftPanelOpen.value;
+  leftPanelOpen.value = nextState;
+  if (isMobileViewport.value && nextState) {
+    rightPanelOpen.value = false;
+  }
 }
 
 function toggleRightPanel() {
-  rightPanelOpen.value = !rightPanelOpen.value;
+  if (!selectedInspectionId.value) return;
+  const nextState = !rightPanelOpen.value;
+  rightPanelOpen.value = nextState;
+  if (isMobileViewport.value && nextState) {
+    leftPanelOpen.value = false;
+  }
 }
 
 function closePanels() {
@@ -1649,6 +1669,9 @@ function resultChipClass(result) {
 }
 
 onMounted(async () => {
+  syncViewportState();
+  window.addEventListener("resize", syncViewportState);
+
   if (!authToken.value) return;
 
   appBusy.value = true;
@@ -1664,9 +1687,32 @@ onMounted(async () => {
   }
 });
 
+onBeforeUnmount(() => {
+  window.removeEventListener("resize", syncViewportState);
+});
+
 watch(selectedInspectionId, (inspectionId) => {
   if (inspectionId != null) {
     rightPanelOpen.value = true;
+    if (isMobileViewport.value) {
+      leftPanelOpen.value = false;
+    }
+  }
+});
+
+watch(isMobileViewport, (mobile) => {
+  if (!mobile) {
+    leftPanelOpen.value = false;
+    rightPanelOpen.value = false;
+    return;
+  }
+
+  if (!leftPanelOpen.value && !rightPanelOpen.value) {
+    if (selectedInspectionId.value != null) {
+      rightPanelOpen.value = true;
+    } else {
+      leftPanelOpen.value = true;
+    }
   }
 });
 
@@ -1786,12 +1832,29 @@ watch(
     </section>
 
     <section v-else class="workspace">
-      <nav class="mobile-dock">
-        <button type="button" class="ghost-btn" @click="toggleLeftPanel">Inspections</button>
-        <button type="button" class="ghost-btn" :disabled="!selectedInspectionId" @click="toggleRightPanel">
+      <nav class="mobile-dock" aria-label="Mobile workspace navigation">
+        <button
+          type="button"
+          :class="['ghost-btn', { active: leftPanelOpen }]"
+          @click="toggleLeftPanel"
+        >
+          Browse
+        </button>
+        <button
+          type="button"
+          :class="['ghost-btn', { active: !leftPanelOpen && !rightPanelOpen }]"
+          @click="closePanels"
+        >
+          Map
+        </button>
+        <button
+          type="button"
+          :class="['ghost-btn', { active: rightPanelOpen }]"
+          :disabled="!selectedInspectionId"
+          @click="toggleRightPanel"
+        >
           Details
         </button>
-        <button type="button" class="ghost-btn" @click="closePanels">Map</button>
       </nav>
 
       <aside :class="['panel', 'left-panel', { open: leftPanelOpen }]">
@@ -2850,11 +2913,18 @@ code {
   grid-template-columns: minmax(280px, 320px) minmax(0, 1fr) minmax(310px, 420px);
   gap: 12px;
   height: calc(100vh - 122px);
+  height: calc(100dvh - 122px);
   min-height: 680px;
 }
 
 .mobile-dock {
   display: none;
+}
+
+.mobile-dock .ghost-btn.active {
+  border-color: #3cb6c9;
+  background: #1a4762;
+  color: #f2fbff;
 }
 
 .panel {
@@ -3468,18 +3538,26 @@ th {
     grid-template-columns: 1fr;
     min-height: 540px;
     height: calc(100vh - 136px);
+    height: calc(100dvh - 136px);
     position: relative;
+    padding-bottom: calc(78px + env(safe-area-inset-bottom));
   }
 
   .mobile-dock {
-    position: absolute;
-    z-index: 70;
-    top: 8px;
-    left: 8px;
-    right: 8px;
+    position: fixed;
+    z-index: 180;
+    left: max(8px, env(safe-area-inset-left));
+    right: max(8px, env(safe-area-inset-right));
+    bottom: max(10px, env(safe-area-inset-bottom));
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 6px;
+    padding: 8px;
+    border: 1px solid rgba(41, 68, 92, 0.92);
+    border-radius: 18px;
+    background: rgba(7, 20, 31, 0.9);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
   }
 
   .mobile-only {
@@ -3489,34 +3567,42 @@ th {
   .left-panel,
   .right-panel {
     position: absolute;
-    top: 50px;
-    bottom: 10px;
-    z-index: 72;
-    width: min(92vw, 390px);
-    transition: transform 180ms ease;
-    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
-  }
-
-  .left-panel {
+    top: 8px;
     left: 8px;
-    transform: translateX(-110%);
-  }
-
-  .left-panel.open {
-    transform: translateX(0);
-  }
-
-  .right-panel {
     right: 8px;
-    transform: translateX(110%);
+    bottom: calc(78px + env(safe-area-inset-bottom));
+    z-index: 190;
+    width: auto;
+    max-width: none;
+    opacity: 0;
+    pointer-events: none;
+    transition: transform 180ms ease, opacity 180ms ease;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+    transform: translateY(18px);
   }
 
+  .left-panel.open,
   .right-panel.open {
-    transform: translateX(0);
+    transform: translateY(0);
+    opacity: 1;
+    pointer-events: auto;
   }
 
   .map-stage {
     min-height: 100%;
+  }
+
+  .tab-strip {
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: thin;
+    white-space: nowrap;
+  }
+
+  .tab-btn {
+    flex: 0 0 auto;
+    min-width: max-content;
+    white-space: nowrap;
   }
 }
 
@@ -3551,8 +3637,9 @@ th {
     grid-template-columns: 1fr;
   }
 
-  .tab-strip {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .mobile-dock {
+    left: 8px;
+    right: 8px;
   }
 }
 </style>

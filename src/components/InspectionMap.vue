@@ -131,6 +131,11 @@ let moveDebounceTimer = null;
 let osmAbortController = null;
 let lastOsmQueryKey = "";
 
+function invalidateMapSize() {
+  if (!map) return;
+  setTimeout(() => map?.invalidateSize(), 0);
+}
+
 const inspectionRows = computed(() => (Array.isArray(props.inspections) ? props.inspections : []));
 const overlayRows = computed(() => (Array.isArray(props.overlays) ? props.overlays : []));
 const teamRows = computed(() => (Array.isArray(props.teams) ? props.teams : []));
@@ -1180,7 +1185,13 @@ onMounted(async () => {
     zoomControl: true,
     minZoom: 2,
     maxZoom: 19,
+    dragging: true,
+    touchZoom: true,
   });
+
+  map.getContainer().style.touchAction = "none";
+  map.getContainer().style.webkitTouchCallout = "none";
+  map.getContainer().style.webkitUserSelect = "none";
 
   map.createPane("osmPane");
   map.getPane("osmPane").style.zIndex = 350;
@@ -1235,6 +1246,8 @@ onMounted(async () => {
   drawDraftLayer();
   hasAutoFit = inspectionRows.value.length > 0;
   scheduleOsmRefresh(true);
+  window.addEventListener("resize", invalidateMapSize);
+  window.addEventListener("orientationchange", invalidateMapSize);
 });
 
 watch(
@@ -1322,6 +1335,9 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  window.removeEventListener("resize", invalidateMapSize);
+  window.removeEventListener("orientationchange", invalidateMapSize);
+
   if (moveDebounceTimer) {
     clearTimeout(moveDebounceTimer);
     moveDebounceTimer = null;
@@ -1616,6 +1632,12 @@ onBeforeUnmount(() => {
 .map-canvas {
   position: absolute;
   inset: 0;
+}
+
+:deep(.leaflet-container) {
+  height: 100%;
+  width: 100%;
+  overscroll-behavior: contain;
 }
 
 .floating-banner {
@@ -1960,11 +1982,11 @@ onBeforeUnmount(() => {
   }
 
   .toolbar-left {
-    bottom: 56px;
+    bottom: calc(126px + env(safe-area-inset-bottom));
   }
 
   .toolbar-right {
-    bottom: 8px;
+    bottom: calc(70px + env(safe-area-inset-bottom));
   }
 
   .toolbar-group {
@@ -1986,7 +2008,7 @@ onBeforeUnmount(() => {
     left: 6px;
     right: 6px;
     top: auto;
-    bottom: 104px;
+    bottom: calc(158px + env(safe-area-inset-bottom));
     width: auto;
     max-height: 48%;
   }
@@ -2005,6 +2027,10 @@ onBeforeUnmount(() => {
 
   .mode-grid {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .map-empty {
+    bottom: calc(76px + env(safe-area-inset-bottom));
   }
 }
 </style>
