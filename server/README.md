@@ -53,11 +53,46 @@ In that state, call `POST /api/auth/change-password` first.
 
 ## Debug Headers (Optional)
 
-This scaffold reads actor context from request headers:
+Debug headers are disabled by default. To enable local-only header auth for development, set:
+
+```bash
+export OGIS_ALLOW_DEBUG_HEADER_AUTH=1
+```
+
+When enabled, this scaffold reads actor context from request headers for loopback requests only:
 
 - `x-user-id`: numeric user id (for example `3`)
 - `x-user-role`: role name(s), comma-separated (for example `inspector`)
 - `x-team-ids`: team ids, comma-separated (for example `1,2`)
+
+## Deployment Security Settings
+
+Login throttling is SQLite-backed (table `login_rate_limits`), so lockouts persist across restarts and are shared by instances that use the same DB file.
+
+Rate-limit tuning:
+
+```bash
+export OGIS_LOGIN_RATE_LIMIT_WINDOW_MS=900000
+export OGIS_LOGIN_RATE_LIMIT_MAX_ATTEMPTS=8
+export OGIS_LOGIN_RATE_LIMIT_LOCK_MS=900000
+```
+
+CORS tuning (disabled by default until allowed origins are set):
+
+```bash
+export OGIS_CORS_ALLOWED_ORIGINS="https://app.example.com,https://admin.example.com"
+export OGIS_CORS_ALLOW_CREDENTIALS=1
+export OGIS_CORS_ALLOWED_METHODS="GET,POST,PATCH,DELETE,OPTIONS"
+export OGIS_CORS_ALLOWED_HEADERS="Authorization,Content-Type"
+export OGIS_CORS_MAX_AGE_SECONDS=600
+```
+
+Security header tuning:
+
+```bash
+export OGIS_API_CSP="default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+export OGIS_PERMISSIONS_POLICY="camera=(), microphone=(), geolocation=()"
+```
 
 ## Sample Requests
 

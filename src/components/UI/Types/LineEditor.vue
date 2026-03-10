@@ -5,6 +5,7 @@ import { storeToRefs } from "pinia";
 import { useStateStore } from "@/stores/stateStore.js";
 import { useWaymark } from "@/composables/useWaymark.js";
 import { State } from "@/classes/State.js";
+import { sanitizeHtmlFragment } from "@/utils/sanitizeHtml.js";
 
 const store = useStateStore();
 const { Waymark, state, isReady } = storeToRefs(store);
@@ -128,6 +129,13 @@ function deleteLineType() {
     }
   }
 }
+
+function renderTypePreview(type) {
+  if (!Waymark.value || typeof Waymark.value.type_preview !== "function") return "";
+  const parsedType = Waymark.value.parse_type(type, "line");
+  const html = Waymark.value.type_preview("line", parsedType);
+  return sanitizeHtmlFragment(html);
+}
 </script>
 <template>
   <div class="type-editor line-editor" v-if="isReady && localLineTypes.length">
@@ -144,9 +152,7 @@ function deleteLineType() {
       >
         <div
           class="type-preview"
-          v-html="
-            Waymark.type_preview('line', Waymark.parse_type(type, 'line'))
-          "
+          v-html="renderTypePreview(type)"
         ></div>
       </div>
     </div>

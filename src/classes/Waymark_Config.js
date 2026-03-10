@@ -11,6 +11,122 @@
  * - Ensuring proper deep cloning of configuration values to maintain state independence
  * - Supporting the undo/redo stack by providing immutable operations
  */
+const ALLOWED_MARKER_SHAPES = new Set(["marker", "circle", "rectangle"]);
+const ALLOWED_MARKER_SIZES = new Set(["small", "medium", "large"]);
+const ALLOWED_ICON_TYPES = new Set(["icon", "text"]);
+
+function sanitizePlainText(value, maxLength = 120) {
+  const normalized = String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/[<>]/g, "")
+    .trim();
+  if (!normalized) return "";
+  return normalized.slice(0, maxLength);
+}
+
+function sanitizeColor(value, fallback) {
+  const normalized = String(value ?? "").trim();
+  if (/^#[0-9a-fA-F]{3,8}$/.test(normalized)) return normalized;
+  if (/^[A-Za-z]{3,20}$/.test(normalized)) return normalized.toLowerCase();
+  return fallback;
+}
+
+function sanitizeMarkerIcon(value, iconType) {
+  const normalized = sanitizePlainText(value, 64);
+  if (iconType === "icon") {
+    const compact = normalized.replace(/\s+/g, "");
+    if (/^(ion-[A-Za-z0-9-]+|fa-[A-Za-z0-9-]+|[A-Za-z0-9-]+)$/.test(compact)) return compact;
+    return "ion-location";
+  }
+  return normalized.slice(0, 8);
+}
+
+function sanitizeBoundedNumberString(value, { min, max, fallback }) {
+  const parsed = Number.parseFloat(String(value ?? "").trim());
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < min || parsed > max) return fallback;
+  return String(parsed);
+}
+
+function sanitizeMarkerType(entry) {
+  const markerShape = ALLOWED_MARKER_SHAPES.has(entry?.marker_shape) ? entry.marker_shape : "marker";
+  const markerSize = ALLOWED_MARKER_SIZES.has(entry?.marker_size) ? entry.marker_size : "medium";
+  const iconType = ALLOWED_ICON_TYPES.has(entry?.icon_type) ? entry.icon_type : "icon";
+
+  return {
+    ...entry,
+    marker_title: sanitizePlainText(entry?.marker_title || "Marker", 64) || "Marker",
+    marker_shape: markerShape,
+    marker_size: markerSize,
+    icon_type: iconType,
+    marker_icon: sanitizeMarkerIcon(entry?.marker_icon, iconType),
+    marker_colour: sanitizeColor(entry?.marker_colour, "#2aabe1"),
+    icon_colour: sanitizeColor(entry?.icon_colour, "#ffffff"),
+  };
+}
+
+function sanitizeLineType(entry) {
+  return {
+    ...entry,
+    line_title: sanitizePlainText(entry?.line_title || "Line", 64) || "Line",
+    line_colour: sanitizeColor(entry?.line_colour, "#487bd9"),
+    line_weight: sanitizeBoundedNumberString(entry?.line_weight, {
+      min: 1,
+      max: 24,
+      fallback: "3",
+    }),
+    line_opacity: sanitizeBoundedNumberString(entry?.line_opacity, {
+      min: 0,
+      max: 1,
+      fallback: "0.7",
+    }),
+  };
+}
+
+function sanitizeShapeType(entry) {
+  return {
+    ...entry,
+    shape_title: sanitizePlainText(entry?.shape_title || "Shape", 64) || "Shape",
+    shape_colour: sanitizeColor(entry?.shape_colour, "#487bd9"),
+    fill_opacity: sanitizeBoundedNumberString(entry?.fill_opacity, {
+      min: 0,
+      max: 1,
+      fallback: "0.5",
+    }),
+  };
+}
+
+function sanitizeTileLayer(entry) {
+  const layerUrl = String(entry?.layer_url ?? "").trim();
+  const safeUrl = /^https?:\/\/[^\s]+$/i.test(layerUrl)
+    ? layerUrl
+    : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
+
+  return {
+    ...entry,
+    layer_name: sanitizePlainText(entry?.layer_name || "OpenStreetMap", 64) || "OpenStreetMap",
+    layer_url: safeUrl,
+    layer_attribution:
+      sanitizePlainText(entry?.layer_attribution || "OSM contributors", 180) || "OSM contributors",
+  };
+}
+
+function sanitizeMapOption(key, value) {
+  if (key === "marker_types" && Array.isArray(value)) {
+    return value.map((entry) => sanitizeMarkerType(entry));
+  }
+  if (key === "line_types" && Array.isArray(value)) {
+    return value.map((entry) => sanitizeLineType(entry));
+  }
+  if (key === "shape_types" && Array.isArray(value)) {
+    return value.map((entry) => sanitizeShapeType(entry));
+  }
+  if (key === "tile_layers" && Array.isArray(value)) {
+    return value.map((entry) => sanitizeTileLayer(entry));
+  }
+  return value;
+}
+
 export class Waymark_Config {
   /**
    * Create a new Waymark_Config instance
@@ -255,10 +371,9 @@ export class Waymark_Config {
     if (config.map_options) {
       for (const key in config.map_options) {
         if (config.map_options.hasOwnProperty(key)) {
+          const sanitized = sanitizeMapOption(key, config.map_options[key]);
           // Deep clone each value to ensure independence
-          this.map_options[key] = JSON.parse(
-            JSON.stringify(config.map_options[key]),
-          );
+          this.map_options[key] = JSON.parse(JSON.stringify(sanitized));
         }
       }
     }

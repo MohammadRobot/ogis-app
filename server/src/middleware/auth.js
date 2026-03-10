@@ -18,6 +18,17 @@ function parseRoles(rawValue) {
     .filter(Boolean);
 }
 
+function isLoopbackAddress(rawValue) {
+  const value = String(rawValue || "").trim();
+  return value === "::1" || value === "127.0.0.1" || value === "::ffff:127.0.0.1";
+}
+
+function canUseDebugHeaders(req) {
+  const enabled = req?.app?.locals?.config?.allowDebugHeaderAuth === true;
+  if (!enabled) return false;
+  return isLoopbackAddress(req?.ip);
+}
+
 export function rolesFromUser(user) {
   if (!user) return [];
   if (Array.isArray(user.roles) && user.roles.length > 0) return user.roles;
@@ -112,6 +123,12 @@ export function attachActorFromHeaders(req, _res, next) {
     return;
   }
 
+  if (!canUseDebugHeaders(req)) {
+    req.user = { roles: [] };
+    next();
+    return;
+  }
+
   const userId = Number.parseInt(req.get("x-user-id"), 10);
   const roles = parseRoles(req.get("x-user-role"));
   const teamIds = parseTeamIds(req.get("x-team-ids"));
@@ -138,9 +155,12 @@ export function requireUser(req, res, next) {
   const roles = rolesFromUser(req?.user);
 
   if (!Number.isFinite(userId) || roles.length === 0) {
+    const debugHeaderAllowed = canUseDebugHeaders(req);
     res.status(401).json({
       error: "Unauthorized",
-      hint: "Send Authorization: Bearer <token> or debug x-user-id/x-user-role/x-team-ids headers.",
+      hint: debugHeaderAllowed
+        ? "Send Authorization: Bearer <token> or local debug x-user-id/x-user-role/x-team-ids headers."
+        : "Send Authorization: Bearer <token>.",
     });
     return;
   }

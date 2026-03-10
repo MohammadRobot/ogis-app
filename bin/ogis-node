@@ -11,6 +11,12 @@ pick_node() {
     return 0
   fi
 
+  path_node="$(command -v node 2>/dev/null || true)"
+  if [ -n "$path_node" ] && [ -x "$path_node" ] && [ "$(version_major "$path_node")" -ge 20 ]; then
+    echo "$path_node"
+    return 0
+  fi
+
   for candidate in \
     "$HOME/.local/node-v22.14.0/bin/node" \
     /usr/local/bin/node \

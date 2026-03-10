@@ -5,6 +5,7 @@ import { storeToRefs } from "pinia";
 import { useStateStore } from "@/stores/stateStore.js";
 import { useWaymark } from "@/composables/useWaymark.js";
 import { State } from "@/classes/State.js";
+import { sanitizeHtmlFragment } from "@/utils/sanitizeHtml.js";
 
 const store = useStateStore();
 const { Waymark, state, isReady } = storeToRefs(store);
@@ -128,6 +129,13 @@ function deleteShapeType() {
     }
   }
 }
+
+function renderTypePreview(type) {
+  if (!Waymark.value || typeof Waymark.value.type_preview !== "function") return "";
+  const parsedType = Waymark.value.parse_type(type, "shape");
+  const html = Waymark.value.type_preview("shape", parsedType);
+  return sanitizeHtmlFragment(html);
+}
 </script>
 <template>
   <div
@@ -148,9 +156,7 @@ function deleteShapeType() {
       >
         <div
           class="type-preview"
-          v-html="
-            Waymark.type_preview('shape', Waymark.parse_type(type, 'shape'))
-          "
+          v-html="renderTypePreview(type)"
         ></div>
       </div>
     </div>

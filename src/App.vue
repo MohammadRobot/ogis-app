@@ -6,18 +6,27 @@ const API_BASE = String(import.meta.env.VITE_API_BASE || "/api").replace(/\/$/, 
 const LOCAL_TOKEN_KEY = "ogis.local.access_token";
 const MOBILE_BREAKPOINT = 980;
 
-const seededProfiles = [
-  { username: "inspector1", password: "local-seed", role: "Inspector" },
-  { username: "supervisor1", password: "local-seed", role: "Supervisor" },
-  { username: "admin", password: "local-seed", role: "Admin" },
-];
 const userRoleOptions = [
   { value: "inspector", label: "Inspector" },
   { value: "supervisor", label: "Supervisor" },
   { value: "admin", label: "Admin" },
 ];
 
-const authToken = ref(localStorage.getItem(LOCAL_TOKEN_KEY) || "");
+function readStoredToken() {
+  if (typeof window === "undefined") return "";
+
+  const sessionToken = sessionStorage.getItem(LOCAL_TOKEN_KEY) || "";
+  if (sessionToken) return sessionToken;
+
+  const legacyToken = localStorage.getItem(LOCAL_TOKEN_KEY) || "";
+  if (legacyToken) {
+    sessionStorage.setItem(LOCAL_TOKEN_KEY, legacyToken);
+    localStorage.removeItem(LOCAL_TOKEN_KEY);
+  }
+  return legacyToken;
+}
+
+const authToken = ref(readStoredToken());
 const currentUser = ref(null);
 const mustChangePassword = ref(false);
 
@@ -42,8 +51,8 @@ const notice = ref("");
 const errorMessage = ref("");
 
 const loginForm = reactive({
-  username: "inspector1",
-  password: "local-seed",
+  username: "",
+  password: "",
 });
 const passwordForm = reactive({
   current_password: "",
@@ -353,8 +362,10 @@ function setError(message) {
 function saveToken(token) {
   authToken.value = token || "";
   if (authToken.value) {
-    localStorage.setItem(LOCAL_TOKEN_KEY, authToken.value);
+    sessionStorage.setItem(LOCAL_TOKEN_KEY, authToken.value);
+    localStorage.removeItem(LOCAL_TOKEN_KEY);
   } else {
+    sessionStorage.removeItem(LOCAL_TOKEN_KEY);
     localStorage.removeItem(LOCAL_TOKEN_KEY);
   }
 }
@@ -1477,11 +1488,6 @@ async function createReviewDecision() {
   }
 }
 
-function applySeedProfile(profile) {
-  loginForm.username = profile.username;
-  loginForm.password = profile.password;
-}
-
 function changeListPage(direction) {
   const nextPage = listFilters.page + direction;
   if (nextPage < 1 || nextPage > (listPagination.value.total_pages || 1)) return;
@@ -1762,20 +1768,6 @@ watch(
           Map-first workflow for site survey, checklists, media evidence, and role-based approvals.
           Data stays on your local server and local storage.
         </p>
-        <div class="seeded-accounts">
-          <p>Quick login profiles</p>
-          <div class="seed-list">
-            <button
-              v-for="profile in seededProfiles"
-              :key="profile.username"
-              type="button"
-              class="ghost-btn"
-              @click="applySeedProfile(profile)"
-            >
-              {{ profile.role }} ({{ profile.username }})
-            </button>
-          </div>
-        </div>
       </article>
 
       <article class="auth-card">

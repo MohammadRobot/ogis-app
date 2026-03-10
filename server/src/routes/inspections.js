@@ -25,6 +25,13 @@ const VALID_INSPECTION_STATUSES = new Set([
   "closed",
 ]);
 const MAX_MEDIA_FILE_SIZE_BYTES = 25 * 1024 * 1024;
+const ALLOWED_MEDIA_MIME_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "application/pdf",
+]);
 const DEFAULT_LIST_LIMIT = 20;
 const MAX_LIST_LIMIT = 100;
 const DEFAULT_TIMELINE_LIMIT = 50;
@@ -298,8 +305,24 @@ function sanitizeFileName(fileName) {
   return safe.length > 0 ? safe : "upload.bin";
 }
 
+function normalizeMimeType(mimeType) {
+  const value = String(mimeType || "").trim().toLowerCase();
+  if (!value) return "";
+  return value.split(";")[0].trim();
+}
+
+function isAllowedMediaMimeType(mimeType) {
+  return ALLOWED_MEDIA_MIME_TYPES.has(normalizeMimeType(mimeType));
+}
+
+function isInlineSafeMediaMimeType(mimeType) {
+  const normalized = normalizeMimeType(mimeType);
+  if (!normalized) return false;
+  return normalized.startsWith("image/") || normalized === "application/pdf";
+}
+
 function detectMediaType(mimeType) {
-  const value = String(mimeType || "").toLowerCase();
+  const value = normalizeMimeType(mimeType);
   if (value.startsWith("image/")) return "photo";
   return "document";
 }
@@ -912,6 +935,19 @@ function buildInspectionListQueryContext(req) {
 function isAdminUser(user) {
   const roles = rolesFromUser(user);
   return can(roles, "manage", "users", { actor: user });
+}
+
+function canManageMasterMapOverlays(user) {
+  const roles = rolesFromUser(user);
+  return can(roles, "create", "sites", { actor: user });
+}
+
+function requireMasterMapOverlayWrite(req, res, next) {
+  if (!canManageMasterMapOverlays(req.user)) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+  next();
 }
 
 function explainQueryPlan(db, sql, params = []) {
@@ -1630,116 +1666,123 @@ router.get("/master-map", requireUser, requirePasswordChangeCompleted, (req, res
   });
 });
 
-router.post("/master-map/overlays", requireUser, requirePasswordChangeCompleted, (req, res) => {
-  const db = req.app.locals.db;
-  const kind = normalizeNullableText(req.body?.kind)?.toLowerCase();
-  if (!kind || !VALID_MASTER_OVERLAY_KINDS.has(kind)) {
-    res.status(400).json({
-      error: "Invalid request",
-      message: "kind must be one of: zone, label",
-    });
-    return;
-  }
-
-  const title = normalizeNullableText(req.body?.title);
-  const labelText = normalizeNullableText(req.body?.label_text);
-
-  let latitude = null;
-  let longitude = null;
-  let geometryJson = null;
-
-  if (kind === "zone") {
-    const normalizedGeometry = normalizeInspectionGeometry(req.body?.geometry);
-    if (normalizedGeometry.error || normalizedGeometry.geometry_type !== "area") {
+router.post(
+  "/master-map/overlays",
+  requireUser,
+  requirePasswordChangeCompleted,
+  requireMasterMapOverlayWrite,
+  (req, res) => {
+    const db = req.app.locals.db;
+    const kind = normalizeNullableText(req.body?.kind)?.toLowerCase();
+    if (!kind || !VALID_MASTER_OVERLAY_KINDS.has(kind)) {
       res.status(400).json({
         error: "Invalid request",
-        message: normalizedGeometry.error || "zone requires Polygon or MultiPolygon geometry",
+        message: "kind must be one of: zone, label",
       });
       return;
     }
 
-    const serializedGeometry = safeStringifyJson(normalizedGeometry.geometry);
-    if (!serializedGeometry) {
-      res.status(400).json({
-        error: "Invalid request",
-        message: "Could not serialize zone geometry",
-      });
-      return;
+    const title = normalizeNullableText(req.body?.title);
+    const labelText = normalizeNullableText(req.body?.label_text);
+
+    let latitude = null;
+    let longitude = null;
+    let geometryJson = null;
+
+    if (kind === "zone") {
+      const normalizedGeometry = normalizeInspectionGeometry(req.body?.geometry);
+      if (normalizedGeometry.error || normalizedGeometry.geometry_type !== "area") {
+        res.status(400).json({
+          error: "Invalid request",
+          message: normalizedGeometry.error || "zone requires Polygon or MultiPolygon geometry",
+        });
+        return;
+      }
+
+      const serializedGeometry = safeStringifyJson(normalizedGeometry.geometry);
+      if (!serializedGeometry) {
+        res.status(400).json({
+          error: "Invalid request",
+          message: "Could not serialize zone geometry",
+        });
+        return;
+      }
+
+      geometryJson = serializedGeometry;
+      latitude = normalizedGeometry.latitude;
+      longitude = normalizedGeometry.longitude;
+    } else {
+      latitude = parseCoordinate(req.body?.latitude, -90, 90);
+      longitude = parseCoordinate(req.body?.longitude, -180, 180);
+      if (latitude == null || longitude == null || !labelText) {
+        res.status(400).json({
+          error: "Invalid request",
+          message: "label overlays require label_text, latitude, and longitude",
+        });
+        return;
+      }
     }
 
-    geometryJson = serializedGeometry;
-    latitude = normalizedGeometry.latitude;
-    longitude = normalizedGeometry.longitude;
-  } else {
-    latitude = parseCoordinate(req.body?.latitude, -90, 90);
-    longitude = parseCoordinate(req.body?.longitude, -180, 180);
-    if (latitude == null || longitude == null || !labelText) {
-      res.status(400).json({
-        error: "Invalid request",
-        message: "label overlays require label_text, latitude, and longitude",
-      });
-      return;
-    }
-  }
-
-  const result = db
-    .prepare(
-      `
-      INSERT INTO master_map_overlays (
-        kind,
-        title,
-        label_text,
-        geometry_json,
-        latitude,
-        longitude,
-        created_by
+    const result = db
+      .prepare(
+        `
+        INSERT INTO master_map_overlays (
+          kind,
+          title,
+          label_text,
+          geometry_json,
+          latitude,
+          longitude,
+          created_by
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        `
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      `
-    )
-    .run(kind, title, labelText, geometryJson, latitude, longitude, req.user.id);
+      .run(kind, title, labelText, geometryJson, latitude, longitude, req.user.id);
 
-  const created = db
-    .prepare(
-      `
-      SELECT
-        id,
-        kind,
-        title,
-        label_text,
-        geometry_json,
-        latitude,
-        longitude,
-        created_by,
-        created_at,
-        updated_at
-      FROM master_map_overlays
-      WHERE id = ?
-      LIMIT 1
-      `
-    )
-    .get(Number(result.lastInsertRowid));
+    const created = db
+      .prepare(
+        `
+        SELECT
+          id,
+          kind,
+          title,
+          label_text,
+          geometry_json,
+          latitude,
+          longitude,
+          created_by,
+          created_at,
+          updated_at
+        FROM master_map_overlays
+        WHERE id = ?
+        LIMIT 1
+        `
+      )
+      .get(Number(result.lastInsertRowid));
 
-  writeAuditLog(
-    db,
-    req.user.id,
-    "master_map.overlay_created",
-    "master_map_overlays",
-    created.id,
-    {
-      kind: created.kind,
-      title: created.title,
-      label_text: created.label_text,
-    }
-  );
+    writeAuditLog(
+      db,
+      req.user.id,
+      "master_map.overlay_created",
+      "master_map_overlays",
+      created.id,
+      {
+        kind: created.kind,
+        title: created.title,
+        label_text: created.label_text,
+      }
+    );
 
-  res.status(201).json({ data: normalizeMasterOverlayRow(created) });
-});
+    res.status(201).json({ data: normalizeMasterOverlayRow(created) });
+  }
+);
 
 router.patch(
   "/master-map/overlays/:overlayId",
   requireUser,
   requirePasswordChangeCompleted,
+  requireMasterMapOverlayWrite,
   (req, res) => {
     const overlayId = parseInteger(req.params?.overlayId);
     if (overlayId == null) {
@@ -1893,6 +1936,7 @@ router.delete(
   "/master-map/overlays/:overlayId",
   requireUser,
   requirePasswordChangeCompleted,
+  requireMasterMapOverlayWrite,
   (req, res) => {
     const overlayId = parseInteger(req.params?.overlayId);
     if (overlayId == null) {
@@ -2905,15 +2949,21 @@ router.get(
       return;
     }
 
+    const safeMimeType = isAllowedMediaMimeType(media.mime_type) ? normalizeMimeType(media.mime_type) : "";
+    const contentType = safeMimeType || "application/octet-stream";
     const download = String(req.query?.download || "").toLowerCase();
-    const disposition = download === "1" || download === "true" ? "attachment" : "inline";
+    const requestedAttachment = download === "1" || download === "true";
+    const disposition =
+      requestedAttachment || !isInlineSafeMediaMimeType(contentType) ? "attachment" : "inline";
     const downloadName = sanitizeFileName(
       media.original_file_name || media.stored_file_name || `media-${media.id}`
     );
 
-    res.setHeader("Content-Type", media.mime_type || "application/octet-stream");
+    res.setHeader("Content-Type", contentType);
     res.setHeader("Content-Length", String(stat.size));
     res.setHeader("Content-Disposition", `${disposition}; filename=\"${downloadName}\"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
 
     writeAuditLog(db, req.user.id, "inspection.media_file_read", "media_files", media.id, {
       inspection_id: req.inspection.id,
@@ -3123,9 +3173,18 @@ router.post(
       return;
     }
 
+    const mimeType = normalizeMimeType(uploadedFile.mimetype);
+    if (!isAllowedMediaMimeType(mimeType)) {
+      cleanupUploadedFile();
+      res.status(415).json({
+        error: "Unsupported media type",
+        message: `Allowed types: ${Array.from(ALLOWED_MEDIA_MIME_TYPES).join(", ")}`,
+      });
+      return;
+    }
+
     const originalFileName = sanitizeFileName(uploadedFile.originalname);
     const storedFileName = sanitizeFileName(uploadedFile.filename);
-    const mimeType = uploadedFile.mimetype || "application/octet-stream";
     const mediaType = detectMediaType(mimeType);
     const fileSizeBytes = uploadedFile.size || 0;
     const checksumSha256 = computeFileSha256(uploadedFile.path);

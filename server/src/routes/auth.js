@@ -8,6 +8,167 @@ import { writeAuditLog } from "../utils/audit.js";
 const router = Router();
 const USERNAME_PATTERN = /^[A-Za-z0-9._-]{3,32}$/;
 const USER_ROLES = new Set(["admin", "supervisor", "inspector"]);
+const DEFAULT_LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const DEFAULT_LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 8;
+const DEFAULT_LOGIN_RATE_LIMIT_LOCK_MS = 15 * 60 * 1000;
+
+function normalizeLoginRateLimitKey(username, ipAddress) {
+  return `${String(username || "").trim().toLowerCase()}|${String(ipAddress || "").trim() || "unknown"}`;
+}
+
+function getLoginRateLimitConfig(req) {
+  const config = req?.app?.locals?.config || {};
+  const windowMs = Number(config.loginRateLimitWindowMs);
+  const maxAttempts = Number(config.loginRateLimitMaxAttempts);
+  const lockMs = Number(config.loginRateLimitLockMs);
+  return {
+    windowMs: Number.isFinite(windowMs) && windowMs > 0 ? windowMs : DEFAULT_LOGIN_RATE_LIMIT_WINDOW_MS,
+    maxAttempts:
+      Number.isFinite(maxAttempts) && maxAttempts > 0
+        ? Math.floor(maxAttempts)
+        : DEFAULT_LOGIN_RATE_LIMIT_MAX_ATTEMPTS,
+    lockMs: Number.isFinite(lockMs) && lockMs > 0 ? lockMs : DEFAULT_LOGIN_RATE_LIMIT_LOCK_MS,
+  };
+}
+
+function pruneLoginRateLimits(db, nowMs, windowMs) {
+  db.prepare(
+    `
+    DELETE FROM login_rate_limits
+    WHERE locked_until_ms <= ?
+      AND window_started_ms < ?
+    `
+  ).run(nowMs, Math.max(0, nowMs - windowMs));
+}
+
+function getOrInitializeLoginRateLimitState(db, rateLimitKey, nowMs, windowMs) {
+  const existing = db
+    .prepare(
+      `
+      SELECT
+        rate_key,
+        window_started_ms,
+        attempt_count,
+        locked_until_ms
+      FROM login_rate_limits
+      WHERE rate_key = ?
+      LIMIT 1
+      `
+    )
+    .get(rateLimitKey);
+
+  if (!existing) {
+    const created = {
+      rate_key: rateLimitKey,
+      attemptCount: 0,
+      windowStartedMs: nowMs,
+      lockedUntilMs: 0,
+    };
+    db.prepare(
+      `
+      INSERT INTO login_rate_limits (
+        rate_key,
+        window_started_ms,
+        attempt_count,
+        locked_until_ms,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      `
+    ).run(created.rate_key, created.windowStartedMs, created.attemptCount, created.lockedUntilMs);
+    return created;
+  }
+
+  let attemptCount = Number(existing.attempt_count) || 0;
+  let windowStartedMs = Number(existing.window_started_ms) || nowMs;
+  let lockedUntilMs = Number(existing.locked_until_ms) || 0;
+
+  if (lockedUntilMs <= nowMs && nowMs - windowStartedMs > windowMs) {
+    attemptCount = 0;
+    windowStartedMs = nowMs;
+    lockedUntilMs = 0;
+    db.prepare(
+      `
+      UPDATE login_rate_limits
+      SET
+        attempt_count = ?,
+        window_started_ms = ?,
+        locked_until_ms = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE rate_key = ?
+      `
+    ).run(attemptCount, windowStartedMs, lockedUntilMs, rateLimitKey);
+  }
+
+  return {
+    rate_key: rateLimitKey,
+    attemptCount,
+    windowStartedMs,
+    lockedUntilMs,
+  };
+}
+
+function loginRateLimitRetrySeconds(state, nowMs) {
+  if (!state || state.lockedUntilMs <= nowMs) return 0;
+  return Math.max(1, Math.ceil((state.lockedUntilMs - nowMs) / 1000));
+}
+
+function loadLoginRateLimitState(req, username, nowMs) {
+  const db = req.app.locals.db;
+  const { windowMs } = getLoginRateLimitConfig(req);
+  const rateLimitKey = normalizeLoginRateLimitKey(username, req.ip);
+
+  return db.transaction(() => {
+    pruneLoginRateLimits(db, nowMs, windowMs);
+    return getOrInitializeLoginRateLimitState(db, rateLimitKey, nowMs, windowMs);
+  })();
+}
+
+function noteFailedLoginAttempt(req, username, nowMs) {
+  const db = req.app.locals.db;
+  const { windowMs, maxAttempts, lockMs } = getLoginRateLimitConfig(req);
+  const rateLimitKey = normalizeLoginRateLimitKey(username, req.ip);
+
+  return db.transaction(() => {
+    pruneLoginRateLimits(db, nowMs, windowMs);
+    const state = getOrInitializeLoginRateLimitState(db, rateLimitKey, nowMs, windowMs);
+
+    if (state.lockedUntilMs > nowMs) {
+      return state;
+    }
+
+    const nextAttemptCount = state.attemptCount + 1;
+    const nextLockedUntilMs = nextAttemptCount >= maxAttempts ? nowMs + lockMs : 0;
+    db.prepare(
+      `
+      UPDATE login_rate_limits
+      SET
+        attempt_count = ?,
+        locked_until_ms = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE rate_key = ?
+      `
+    ).run(nextAttemptCount, nextLockedUntilMs, rateLimitKey);
+
+    return {
+      rate_key: rateLimitKey,
+      attemptCount: nextAttemptCount,
+      windowStartedMs: state.windowStartedMs,
+      lockedUntilMs: nextLockedUntilMs,
+    };
+  })();
+}
+
+function clearLoginRateLimit(req, username) {
+  const db = req.app.locals.db;
+  const rateLimitKey = normalizeLoginRateLimitKey(username, req.ip);
+  db.prepare(
+    `
+    DELETE FROM login_rate_limits
+    WHERE rate_key = ?
+    `
+  ).run(rateLimitKey);
+}
 
 function sanitizeUserRow(row) {
   if (!row) return null;
@@ -211,6 +372,16 @@ router.post("/login", (req, res) => {
     return;
   }
 
+  const nowMs = Date.now();
+  const rateLimitState = loadLoginRateLimitState(req, username, nowMs);
+  if (rateLimitState.lockedUntilMs > nowMs) {
+    res.status(429).json({
+      error: "Too many login attempts",
+      retry_after_seconds: loginRateLimitRetrySeconds(rateLimitState, nowMs),
+    });
+    return;
+  }
+
   const db = req.app.locals.db;
   const user = db
     .prepare(
@@ -224,6 +395,14 @@ router.post("/login", (req, res) => {
     .get(username);
 
   if (!user || !verifyPassword(password, user.password_hash)) {
+    const updatedState = noteFailedLoginAttempt(req, username, nowMs);
+    if (updatedState.lockedUntilMs > nowMs) {
+      res.status(429).json({
+        error: "Too many login attempts",
+        retry_after_seconds: loginRateLimitRetrySeconds(updatedState, nowMs),
+      });
+      return;
+    }
     res.status(401).json({ error: "Invalid credentials" });
     return;
   }
@@ -235,6 +414,8 @@ router.post("/login", (req, res) => {
     });
     return;
   }
+
+  clearLoginRateLimit(req, username);
 
   let authenticatedUser = user;
 

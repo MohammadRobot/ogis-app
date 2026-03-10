@@ -5,6 +5,7 @@ import { storeToRefs } from "pinia";
 import { useStateStore } from "@/stores/stateStore.js";
 import { useWaymark } from "@/composables/useWaymark.js";
 import { State } from "@/classes/State.js";
+import { sanitizeHtmlFragment } from "@/utils/sanitizeHtml.js";
 
 const store = useStateStore();
 const { Waymark, state, isReady } = storeToRefs(store);
@@ -128,6 +129,13 @@ function deleteMarkerType() {
     }
   }
 }
+
+function renderTypePreview(type) {
+  if (!Waymark.value || typeof Waymark.value.type_preview !== "function") return "";
+  const parsedType = Waymark.value.parse_type(type, "marker");
+  const html = Waymark.value.type_preview("marker", parsedType);
+  return sanitizeHtmlFragment(html);
+}
 </script>
 <template>
   <div
@@ -151,9 +159,7 @@ function deleteMarkerType() {
       >
         <div
           class="type-preview"
-          v-html="
-            Waymark.type_preview('marker', Waymark.parse_type(type, 'marker'))
-          "
+          v-html="renderTypePreview(type)"
         ></div>
         <div class="preview-title">{{ type.marker_title }}</div>
       </div>
