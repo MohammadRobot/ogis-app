@@ -33,6 +33,7 @@ const mustChangePassword = ref(false);
 const authBusy = ref(false);
 const appBusy = ref(false);
 const inspectionBusy = ref(false);
+const inspectionDeleteBusy = ref(false);
 const checklistBusy = ref(false);
 const mediaBusy = ref(false);
 const timelineBusy = ref(false);
@@ -46,6 +47,15 @@ const userTeamBusyId = ref(null);
 const userRoleBusyId = ref(null);
 const userStatusBusyId = ref(null);
 const userPasswordBusyId = ref(null);
+const backupExportBusy = ref(false);
+const backupImportBusy = ref(false);
+const backupImportFile = ref(null);
+const backupImportInputRef = ref(null);
+const checklistTemplateBusy = ref(false);
+const checklistTemplateSaveBusyId = ref(null);
+const checklistTemplateDeleteBusyId = ref(null);
+const checklistTemplateApplyBusy = ref(false);
+const checklistTemplateSelection = ref("");
 
 const notice = ref("");
 const errorMessage = ref("");
@@ -84,6 +94,7 @@ const summary = ref({
 const inspections = ref([]);
 const teamDirectory = ref([]);
 const userDirectory = ref([]);
+const checklistTemplateDirectory = ref([]);
 const listPagination = ref({
   page: 1,
   limit: 12,
@@ -105,17 +116,39 @@ const mapMeta = ref({
 const selectedInspectionId = ref(null);
 const selectedInspection = ref(null);
 const activeTab = ref("overview");
+const workspaceRef = ref(null);
 const leftPanelOpen = ref(false);
 const rightPanelOpen = ref(false);
+const leftPanelExpanded = ref(false);
+const rightPanelExpanded = ref(false);
+const mapExpanded = ref(false);
 const isMobileViewport = ref(false);
 const leftRailTab = ref("list");
 const createPlacementActive = ref(false);
 const createPlacementKind = ref("point");
 const createGeometryDraft = ref(null);
+const leftPanelWidth = ref(340);
+const rightPanelWidth = ref(420);
+const panelResizeState = reactive({
+  side: "",
+  startX: 0,
+  startLeft: 340,
+  startRight: 420,
+});
+const PANEL_GAP = 12;
+const PANEL_RESIZER_WIDTH = 10;
+const MIN_MAP_WIDTH = 360;
+const MIN_LEFT_PANEL_WIDTH = 260;
+const MAX_LEFT_PANEL_WIDTH = 520;
+const MIN_RIGHT_PANEL_WIDTH = 300;
+const MAX_RIGHT_PANEL_WIDTH = 620;
 const teamNameDrafts = reactive({});
 const userTeamDrafts = reactive({});
 const userRoleDrafts = reactive({});
 const userPasswordDrafts = reactive({});
+const checklistTemplateKeyDrafts = reactive({});
+const checklistTemplateLabelDrafts = reactive({});
+const checklistTemplateOrderDrafts = reactive({});
 const newTeamForm = reactive({
   name: "",
 });
@@ -125,6 +158,11 @@ const newUserForm = reactive({
   role: "inspector",
   team_id: "",
   password: "",
+});
+const newChecklistTemplateForm = reactive({
+  item_key: "",
+  item_label: "",
+  sort_order: "",
 });
 
 const timelineFilters = reactive({
@@ -186,6 +224,21 @@ const userRoles = computed(() => currentUser.value?.roles || []);
 const isAdminUser = computed(() => userRoles.value.includes("admin"));
 const hasSupervisorPrivileges = computed(
   () => userRoles.value.includes("supervisor") || userRoles.value.includes("admin")
+);
+const workspaceStyle = computed(() => {
+  if (isMobileViewport.value) return {};
+  return {
+    "--workspace-left": `${leftPanelWidth.value}px`,
+    "--workspace-right": `${rightPanelWidth.value}px`,
+    "--workspace-resizer": `${PANEL_RESIZER_WIDTH}px`,
+  };
+});
+const showPanelResizers = computed(
+  () =>
+    !isMobileViewport.value &&
+    !mapExpanded.value &&
+    !leftPanelExpanded.value &&
+    !rightPanelExpanded.value
 );
 const canSubmitFromCurrentStatus = computed(() =>
   ["draft", "reopened"].includes(String(selectedInspection.value?.status || "").toLowerCase())
@@ -318,6 +371,24 @@ function syncUserPasswordDrafts() {
   }
 }
 
+function syncChecklistTemplateDrafts() {
+  for (const key of Object.keys(checklistTemplateKeyDrafts)) {
+    delete checklistTemplateKeyDrafts[key];
+  }
+  for (const key of Object.keys(checklistTemplateLabelDrafts)) {
+    delete checklistTemplateLabelDrafts[key];
+  }
+  for (const key of Object.keys(checklistTemplateOrderDrafts)) {
+    delete checklistTemplateOrderDrafts[key];
+  }
+
+  for (const item of checklistTemplateDirectory.value) {
+    checklistTemplateKeyDrafts[item.id] = item.item_key || "";
+    checklistTemplateLabelDrafts[item.id] = item.item_label || "";
+    checklistTemplateOrderDrafts[item.id] = String(Number(item.sort_order) || 0);
+  }
+}
+
 function hasTeamNameChanged(team) {
   const currentName = String(team?.name || team?.label || "").trim();
   const draftName = String(teamNameDrafts[team?.id] || "").trim();
@@ -340,6 +411,18 @@ function hasUserPasswordDraft(userId) {
   return String(userPasswordDrafts[userId] || "").trim().length > 0;
 }
 
+function hasChecklistTemplateChanged(item) {
+  const nextKey = String(checklistTemplateKeyDrafts[item?.id] || "").trim().toLowerCase();
+  const nextLabel = String(checklistTemplateLabelDrafts[item?.id] || "").trim();
+  const nextOrder = parseInteger(checklistTemplateOrderDrafts[item?.id]);
+  const currentKey = String(item?.item_key || "").trim().toLowerCase();
+  const currentLabel = String(item?.item_label || "").trim();
+  const currentOrder = Number(item?.sort_order || 0);
+
+  if (!nextKey || !nextLabel || !Number.isFinite(nextOrder) || nextOrder < 0) return false;
+  return nextKey !== currentKey || nextLabel !== currentLabel || nextOrder !== currentOrder;
+}
+
 function clearMessages() {
   notice.value = "";
   errorMessage.value = "";
@@ -348,6 +431,101 @@ function clearMessages() {
 function syncViewportState() {
   if (typeof window === "undefined") return;
   isMobileViewport.value = window.innerWidth <= MOBILE_BREAKPOINT;
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function getWorkspaceContentWidth() {
+  const width = Number(workspaceRef.value?.clientWidth || 0);
+  if (Number.isFinite(width) && width > 0) return width;
+  if (typeof window === "undefined") return 0;
+  return Math.max(window.innerWidth - 28, 0);
+}
+
+function getLeftPanelWidthBounds() {
+  const workspaceWidth = getWorkspaceContentWidth();
+  if (!Number.isFinite(workspaceWidth) || workspaceWidth <= 0) {
+    return { min: MIN_LEFT_PANEL_WIDTH, max: MAX_LEFT_PANEL_WIDTH };
+  }
+
+  const reservedWidth = MIN_MAP_WIDTH + rightPanelWidth.value + PANEL_RESIZER_WIDTH * 2 + PANEL_GAP * 4;
+  const computedMax = workspaceWidth - reservedWidth;
+  return {
+    min: MIN_LEFT_PANEL_WIDTH,
+    max: Math.max(MIN_LEFT_PANEL_WIDTH, Math.min(MAX_LEFT_PANEL_WIDTH, computedMax)),
+  };
+}
+
+function getRightPanelWidthBounds() {
+  const workspaceWidth = getWorkspaceContentWidth();
+  if (!Number.isFinite(workspaceWidth) || workspaceWidth <= 0) {
+    return { min: MIN_RIGHT_PANEL_WIDTH, max: MAX_RIGHT_PANEL_WIDTH };
+  }
+
+  const reservedWidth = MIN_MAP_WIDTH + leftPanelWidth.value + PANEL_RESIZER_WIDTH * 2 + PANEL_GAP * 4;
+  const computedMax = workspaceWidth - reservedWidth;
+  return {
+    min: MIN_RIGHT_PANEL_WIDTH,
+    max: Math.max(MIN_RIGHT_PANEL_WIDTH, Math.min(MAX_RIGHT_PANEL_WIDTH, computedMax)),
+  };
+}
+
+function normalizePanelWidths() {
+  if (isMobileViewport.value || mapExpanded.value) return;
+
+  const leftBounds = getLeftPanelWidthBounds();
+  leftPanelWidth.value = clampNumber(leftPanelWidth.value, leftBounds.min, leftBounds.max);
+
+  const rightBounds = getRightPanelWidthBounds();
+  rightPanelWidth.value = clampNumber(rightPanelWidth.value, rightBounds.min, rightBounds.max);
+
+  const leftBoundsAfterRight = getLeftPanelWidthBounds();
+  leftPanelWidth.value = clampNumber(leftPanelWidth.value, leftBoundsAfterRight.min, leftBoundsAfterRight.max);
+}
+
+function onPanelResizeMove(event) {
+  if (!panelResizeState.side) return;
+  const delta = Number(event?.clientX || 0) - panelResizeState.startX;
+
+  if (panelResizeState.side === "left") {
+    const nextLeft = panelResizeState.startLeft + delta;
+    const bounds = getLeftPanelWidthBounds();
+    leftPanelWidth.value = clampNumber(nextLeft, bounds.min, bounds.max);
+    return;
+  }
+
+  if (panelResizeState.side === "right") {
+    const nextRight = panelResizeState.startRight - delta;
+    const bounds = getRightPanelWidthBounds();
+    rightPanelWidth.value = clampNumber(nextRight, bounds.min, bounds.max);
+  }
+}
+
+function stopPanelResize() {
+  if (!panelResizeState.side) return;
+  panelResizeState.side = "";
+  window.removeEventListener("mousemove", onPanelResizeMove);
+  window.removeEventListener("mouseup", stopPanelResize);
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+}
+
+function startPanelResize(side, event) {
+  if (isMobileViewport.value || mapExpanded.value || leftPanelExpanded.value || rightPanelExpanded.value) return;
+  if (side !== "left" && side !== "right") return;
+
+  panelResizeState.side = side;
+  panelResizeState.startX = Number(event?.clientX || 0);
+  panelResizeState.startLeft = leftPanelWidth.value;
+  panelResizeState.startRight = rightPanelWidth.value;
+
+  window.addEventListener("mousemove", onPanelResizeMove);
+  window.addEventListener("mouseup", stopPanelResize);
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+  event?.preventDefault?.();
 }
 
 function setNotice(message) {
@@ -376,6 +554,7 @@ function resetWorkspace() {
   inspections.value = [];
   teamDirectory.value = [];
   userDirectory.value = [];
+  checklistTemplateDirectory.value = [];
   for (const key of Object.keys(teamNameDrafts)) {
     delete teamNameDrafts[key];
   }
@@ -387,6 +566,15 @@ function resetWorkspace() {
   }
   for (const key of Object.keys(userPasswordDrafts)) {
     delete userPasswordDrafts[key];
+  }
+  for (const key of Object.keys(checklistTemplateKeyDrafts)) {
+    delete checklistTemplateKeyDrafts[key];
+  }
+  for (const key of Object.keys(checklistTemplateLabelDrafts)) {
+    delete checklistTemplateLabelDrafts[key];
+  }
+  for (const key of Object.keys(checklistTemplateOrderDrafts)) {
+    delete checklistTemplateOrderDrafts[key];
   }
   mapInspections.value = [];
   mapMeta.value = {
@@ -404,6 +592,9 @@ function resetWorkspace() {
   locationDraft.latitude = "";
   locationDraft.longitude = "";
   activeTab.value = "overview";
+  leftPanelExpanded.value = false;
+  rightPanelExpanded.value = false;
+  mapExpanded.value = false;
   createPlacementActive.value = false;
   createPlacementKind.value = "point";
   createGeometryDraft.value = null;
@@ -414,12 +605,27 @@ function resetWorkspace() {
   userRoleBusyId.value = null;
   userStatusBusyId.value = null;
   userPasswordBusyId.value = null;
+  inspectionDeleteBusy.value = false;
+  backupExportBusy.value = false;
+  backupImportBusy.value = false;
+  backupImportFile.value = null;
+  checklistTemplateBusy.value = false;
+  checklistTemplateSaveBusyId.value = null;
+  checklistTemplateDeleteBusyId.value = null;
+  checklistTemplateApplyBusy.value = false;
+  checklistTemplateSelection.value = "";
+  if (backupImportInputRef.value) {
+    backupImportInputRef.value.value = "";
+  }
   newTeamForm.name = "";
   newUserForm.username = "";
   newUserForm.full_name = "";
   newUserForm.role = "inspector";
   newUserForm.team_id = "";
   newUserForm.password = "";
+  newChecklistTemplateForm.item_key = "";
+  newChecklistTemplateForm.item_label = "";
+  newChecklistTemplateForm.sort_order = "";
 }
 
 function logout(resetNotice = true) {
@@ -586,8 +792,181 @@ async function loadDirectory() {
     syncUserPasswordDrafts();
     seedCreateFormDirectoryDefaults();
     seedNewUserFormDirectoryDefaults();
+    if (isAdminUser.value) {
+      await loadChecklistTemplates();
+    } else {
+      checklistTemplateDirectory.value = [];
+      syncChecklistTemplateDrafts();
+    }
   } finally {
     directoryBusy.value = false;
+  }
+}
+
+async function loadChecklistTemplates() {
+  checklistTemplateBusy.value = true;
+  try {
+    const response = await apiRequest("/auth/checklist-templates");
+    checklistTemplateDirectory.value = Array.isArray(response?.data) ? response.data : [];
+    if (
+      checklistTemplateSelection.value &&
+      !checklistTemplateDirectory.value.some((item) => item.item_key === checklistTemplateSelection.value)
+    ) {
+      checklistTemplateSelection.value = "";
+    }
+    syncChecklistTemplateDrafts();
+  } finally {
+    checklistTemplateBusy.value = false;
+  }
+}
+
+async function createChecklistTemplate() {
+  clearMessages();
+  const itemKey = String(newChecklistTemplateForm.item_key || "").trim().toLowerCase();
+  const itemLabel = String(newChecklistTemplateForm.item_label || "").trim();
+  const sortOrderRaw = String(newChecklistTemplateForm.sort_order || "").trim();
+  const sortOrder = sortOrderRaw ? parseInteger(sortOrderRaw) : null;
+
+  if (!itemKey) {
+    setError("Checklist item key is required.");
+    return;
+  }
+  if (!itemLabel) {
+    setError("Checklist item label is required.");
+    return;
+  }
+  if (sortOrderRaw && (!Number.isFinite(sortOrder) || sortOrder < 0)) {
+    setError("Sort order must be a non-negative integer.");
+    return;
+  }
+
+  checklistTemplateBusy.value = true;
+  try {
+    await apiRequest("/auth/checklist-templates", {
+      method: "POST",
+      body: {
+        item_key: itemKey,
+        item_label: itemLabel,
+        sort_order: sortOrder,
+      },
+    });
+    newChecklistTemplateForm.item_key = "";
+    newChecklistTemplateForm.item_label = "";
+    newChecklistTemplateForm.sort_order = "";
+    await loadChecklistTemplates();
+    setNotice(`Checklist template added: ${itemLabel}.`);
+  } catch (error) {
+    setError(formatApiError(error, "Could not create checklist template"));
+  } finally {
+    checklistTemplateBusy.value = false;
+  }
+}
+
+async function saveChecklistTemplate(itemId) {
+  clearMessages();
+  const parsedId = Number(itemId);
+  if (!Number.isFinite(parsedId)) return;
+
+  const itemKey = String(checklistTemplateKeyDrafts[parsedId] || "").trim().toLowerCase();
+  const itemLabel = String(checklistTemplateLabelDrafts[parsedId] || "").trim();
+  const sortOrder = parseInteger(checklistTemplateOrderDrafts[parsedId]);
+  if (!itemKey) {
+    setError("Checklist item key is required.");
+    return;
+  }
+  if (!itemLabel) {
+    setError("Checklist item label is required.");
+    return;
+  }
+  if (!Number.isFinite(sortOrder) || sortOrder < 0) {
+    setError("Sort order must be a non-negative integer.");
+    return;
+  }
+
+  checklistTemplateSaveBusyId.value = parsedId;
+  try {
+    const response = await apiRequest(`/auth/checklist-templates/${parsedId}`, {
+      method: "PATCH",
+      body: {
+        item_key: itemKey,
+        item_label: itemLabel,
+        sort_order: sortOrder,
+      },
+    });
+    await loadChecklistTemplates();
+    const changed = Boolean(response?.data?.changed);
+    setNotice(changed ? `Checklist item "${itemKey}" saved.` : `Checklist item "${itemKey}" unchanged.`);
+  } catch (error) {
+    setError(formatApiError(error, "Could not update checklist template"));
+  } finally {
+    checklistTemplateSaveBusyId.value = null;
+  }
+}
+
+async function deleteChecklistTemplate(item) {
+  clearMessages();
+  const parsedId = Number(item?.id);
+  if (!Number.isFinite(parsedId)) return;
+
+  checklistTemplateDeleteBusyId.value = parsedId;
+  try {
+    await apiRequest(`/auth/checklist-templates/${parsedId}`, {
+      method: "DELETE",
+    });
+    await loadChecklistTemplates();
+    setNotice(`Checklist item removed: ${item?.item_label || item?.item_key || parsedId}.`);
+  } catch (error) {
+    setError(formatApiError(error, "Could not remove checklist template"));
+  } finally {
+    checklistTemplateDeleteBusyId.value = null;
+  }
+}
+
+function applyChecklistTemplateSelection() {
+  const selectedKey = String(checklistTemplateSelection.value || "").trim();
+  if (!selectedKey) return;
+
+  const template = checklistTemplateDirectory.value.find((item) => item.item_key === selectedKey);
+  if (!template) return;
+
+  checklistForm.item_key = template.item_key;
+  checklistForm.item_label = template.item_label || checklistForm.item_label;
+}
+
+async function applyChecklistTemplatesToInspection() {
+  if (!selectedInspectionId.value) return;
+  clearMessages();
+
+  if (checklistTemplateDirectory.value.length === 0) {
+    setError("No checklist templates are configured.");
+    return;
+  }
+
+  checklistTemplateApplyBusy.value = true;
+  try {
+    const response = await apiRequest(`/inspections/${selectedInspectionId.value}/items/apply-templates`, {
+      method: "POST",
+    });
+
+    checklistData.value = Array.isArray(response?.data) ? response.data : checklistData.value;
+    checklistOverallResult.value = response?.overall_result || checklistOverallResult.value;
+    await Promise.all([
+      loadInspectionCore(selectedInspectionId.value),
+      loadInspections(false),
+      loadSummary(),
+      loadInspectionMapData(),
+    ]);
+
+    const appliedCount = Number(response?.applied_count || 0);
+    setNotice(
+      appliedCount > 0
+        ? `Added ${appliedCount} checklist template item(s) to this inspection.`
+        : "All checklist template items are already present in this inspection."
+    );
+  } catch (error) {
+    setError(formatApiError(error, "Could not apply checklist templates"));
+  } finally {
+    checklistTemplateApplyBusy.value = false;
   }
 }
 
@@ -832,6 +1211,121 @@ async function resetUserPassword(user) {
   }
 }
 
+function parseContentDispositionFileName(value) {
+  const headerValue = String(value || "").trim();
+  if (!headerValue) return "";
+
+  const utf8Match = headerValue.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch (_error) {
+      return utf8Match[1];
+    }
+  }
+
+  const basicMatch = headerValue.match(/filename="?([^";]+)"?/i);
+  return basicMatch?.[1] ? basicMatch[1].trim() : "";
+}
+
+async function apiBinaryRequest(path, options = {}) {
+  const { method = "GET", body, headers = {}, auth = true } = options;
+  const requestHeaders = { ...headers };
+  const init = {
+    method,
+    headers: requestHeaders,
+  };
+
+  if (auth && authToken.value) {
+    requestHeaders.Authorization = `Bearer ${authToken.value}`;
+  }
+
+  if (body != null) {
+    init.body = body;
+  }
+
+  const response = await fetch(`${API_BASE}${path}`, init);
+  if (!response.ok) {
+    const contentType = response.headers.get("content-type") || "";
+    const isJson = contentType.includes("application/json");
+    const payload = isJson ? await response.json() : null;
+    const error = new Error(payload?.message || payload?.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.payload = payload;
+    if (response.status === 401) {
+      logout(false);
+    }
+    throw error;
+  }
+
+  return response;
+}
+
+async function exportBackup() {
+  clearMessages();
+  backupExportBusy.value = true;
+
+  try {
+    const response = await apiBinaryRequest("/auth/backup/export");
+    const blob = await response.blob();
+    const fileNameFromHeader = parseContentDispositionFileName(response.headers.get("content-disposition"));
+    const fallbackName = `ogis-backup-${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}.json`;
+    const fileName = fileNameFromHeader || fallbackName;
+
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
+    setNotice(`Backup exported: ${fileName}.`);
+  } catch (error) {
+    setError(formatApiError(error, "Could not export backup"));
+  } finally {
+    backupExportBusy.value = false;
+  }
+}
+
+function onBackupFileChange(event) {
+  backupImportFile.value = event?.target?.files?.[0] || null;
+}
+
+function clearBackupImportSelection() {
+  backupImportFile.value = null;
+  if (backupImportInputRef.value) {
+    backupImportInputRef.value.value = "";
+  }
+}
+
+async function importBackup() {
+  clearMessages();
+  if (!backupImportFile.value) {
+    setError("Choose a backup file first.");
+    return;
+  }
+
+  backupImportBusy.value = true;
+  try {
+    const formData = new FormData();
+    formData.append("file", backupImportFile.value);
+    await apiRequest("/auth/backup/import", {
+      method: "POST",
+      body: formData,
+    });
+
+    clearBackupImportSelection();
+    logout(false);
+    setNotice("Backup restored. Sign in again to continue.");
+  } catch (error) {
+    setError(formatApiError(error, "Could not import backup"));
+  } finally {
+    backupImportBusy.value = false;
+  }
+}
+
 async function runLogin() {
   clearMessages();
   authBusy.value = true;
@@ -1020,7 +1514,7 @@ async function createInspection() {
   }
 
   try {
-    await apiRequest("/inspections", {
+    const response = await apiRequest("/inspections", {
       method: "POST",
       body: {
         site_name: newInspectionForm.site_name.trim(),
@@ -1043,7 +1537,12 @@ async function createInspection() {
     createGeometryDraft.value = null;
 
     await Promise.all([loadInspections(false), loadSummary(), loadInspectionMapData()]);
-    setNotice("Inspection created.");
+    const seededChecklistItems = Number(response?.meta?.seeded_checklist_items || 0);
+    setNotice(
+      seededChecklistItems > 0
+        ? `Inspection created. ${seededChecklistItems} checklist template item(s) added.`
+        : "Inspection created."
+    );
   } catch (error) {
     setError(formatApiError(error, "Could not create inspection"));
   }
@@ -1181,6 +1680,7 @@ async function loadInspectionWorkspace(inspectionId) {
 async function selectInspection(inspectionId) {
   if (!Number.isFinite(Number(inspectionId))) return;
   createPlacementActive.value = false;
+  checklistTemplateSelection.value = "";
   selectedInspectionId.value = Number(inspectionId);
   timelineFilters.page = 1;
   await loadInspectionWorkspace(selectedInspectionId.value);
@@ -1199,6 +1699,46 @@ async function submitInspection() {
     setNotice("Inspection submitted.");
   } catch (error) {
     setError(formatApiError(error, "Could not submit inspection"));
+  }
+}
+
+async function deleteInspectionAsAdmin() {
+  if (!selectedInspectionId.value || !isAdminUser.value) return;
+
+  const inspectionId = Number(selectedInspectionId.value);
+  const inspectionLabel = selectedInspection.value?.inspection_no || `#${inspectionId}`;
+  const shouldDelete =
+    typeof window === "undefined"
+      ? true
+      : window.confirm(
+          `Delete inspection ${inspectionLabel}? This will remove checklist items, media, timeline, and review records.`
+        );
+  if (!shouldDelete) return;
+
+  clearMessages();
+  inspectionDeleteBusy.value = true;
+  try {
+    await apiRequest(`/inspections/${inspectionId}`, {
+      method: "DELETE",
+    });
+
+    if (selectedInspectionId.value === inspectionId) {
+      selectedInspectionId.value = null;
+      selectedInspection.value = null;
+      checklistData.value = [];
+      timelineData.value = [];
+      mediaData.value = [];
+      reviewData.value = [];
+      activeTab.value = "overview";
+      checklistTemplateSelection.value = "";
+    }
+
+    await Promise.all([loadInspections(true), loadSummary(), loadInspectionMapData()]);
+    setNotice(`Inspection ${inspectionLabel} deleted.`);
+  } catch (error) {
+    setError(formatApiError(error, "Could not delete inspection"));
+  } finally {
+    inspectionDeleteBusy.value = false;
   }
 }
 
@@ -1601,14 +2141,55 @@ function toggleRightPanel() {
   if (!selectedInspectionId.value) return;
   const nextState = !rightPanelOpen.value;
   rightPanelOpen.value = nextState;
+  if (!nextState) {
+    rightPanelExpanded.value = false;
+  }
   if (isMobileViewport.value && nextState) {
     leftPanelOpen.value = false;
+  }
+}
+
+function clearExpandedPanels() {
+  leftPanelExpanded.value = false;
+  rightPanelExpanded.value = false;
+  mapExpanded.value = false;
+}
+
+function requestMapResize() {
+  if (typeof window === "undefined") return;
+  window.requestAnimationFrame(() => {
+    window.dispatchEvent(new Event("resize"));
+  });
+}
+
+function toggleLeftPanelExpanded() {
+  if (isMobileViewport.value) return;
+  const nextState = !leftPanelExpanded.value;
+  clearExpandedPanels();
+  leftPanelExpanded.value = nextState;
+}
+
+function toggleRightPanelExpanded() {
+  if (isMobileViewport.value || !selectedInspectionId.value) return;
+  const nextState = !rightPanelExpanded.value;
+  clearExpandedPanels();
+  rightPanelExpanded.value = nextState;
+}
+
+function toggleMapExpanded() {
+  const nextState = !mapExpanded.value;
+  clearExpandedPanels();
+  mapExpanded.value = nextState;
+  if (nextState) {
+    leftPanelOpen.value = false;
+    rightPanelOpen.value = false;
   }
 }
 
 function closePanels() {
   leftPanelOpen.value = false;
   rightPanelOpen.value = false;
+  clearExpandedPanels();
 }
 
 function changeTimelinePage(direction) {
@@ -1677,6 +2258,10 @@ function resultChipClass(result) {
 onMounted(async () => {
   syncViewportState();
   window.addEventListener("resize", syncViewportState);
+  window.addEventListener("resize", normalizePanelWidths);
+  window.requestAnimationFrame(() => {
+    normalizePanelWidths();
+  });
 
   if (!authToken.value) return;
 
@@ -1694,7 +2279,9 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  stopPanelResize();
   window.removeEventListener("resize", syncViewportState);
+  window.removeEventListener("resize", normalizePanelWidths);
 });
 
 watch(selectedInspectionId, (inspectionId) => {
@@ -1703,10 +2290,18 @@ watch(selectedInspectionId, (inspectionId) => {
     if (isMobileViewport.value) {
       leftPanelOpen.value = false;
     }
+    return;
   }
+
+  rightPanelExpanded.value = false;
 });
 
 watch(isMobileViewport, (mobile) => {
+  if (mobile) {
+    stopPanelResize();
+    clearExpandedPanels();
+  }
+
   if (!mobile) {
     leftPanelOpen.value = false;
     rightPanelOpen.value = false;
@@ -1720,6 +2315,18 @@ watch(isMobileViewport, (mobile) => {
       leftPanelOpen.value = true;
     }
   }
+
+  window.requestAnimationFrame(() => {
+    normalizePanelWidths();
+  });
+});
+
+watch(mapExpanded, () => {
+  stopPanelResize();
+  requestMapResize();
+  window.requestAnimationFrame(() => {
+    normalizePanelWidths();
+  });
 });
 
 watch(leftRailTab, (tab) => {
@@ -1823,8 +2430,13 @@ watch(
       <button type="button" class="ghost-btn" @click="runLogout">Logout</button>
     </section>
 
-    <section v-else class="workspace">
-      <nav class="mobile-dock" aria-label="Mobile workspace navigation">
+    <section
+      v-else
+      ref="workspaceRef"
+      :class="['workspace', { 'map-only': mapExpanded }]"
+      :style="workspaceStyle"
+    >
+      <nav v-show="!mapExpanded" class="mobile-dock" aria-label="Mobile workspace navigation">
         <button
           type="button"
           :class="['ghost-btn', { active: leftPanelOpen }]"
@@ -1839,6 +2451,7 @@ watch(
         >
           Map
         </button>
+        <button type="button" class="ghost-btn" @click="toggleMapExpanded">Map only</button>
         <button
           type="button"
           :class="['ghost-btn', { active: rightPanelOpen }]"
@@ -1849,15 +2462,28 @@ watch(
         </button>
       </nav>
 
-      <aside :class="['panel', 'left-panel', { open: leftPanelOpen }]">
+      <button
+        v-if="!isMobileViewport && (leftPanelExpanded || rightPanelExpanded)"
+        type="button"
+        class="popup-backdrop"
+        aria-label="Close expanded popup"
+        @click="clearExpandedPanels"
+      />
+
+      <aside v-show="!mapExpanded" :class="['panel', 'left-panel', { open: leftPanelOpen, expanded: leftPanelExpanded }]">
         <div class="panel-head">
           <div>
             <p class="eyebrow">Workspace</p>
             <h2>Inspections</h2>
           </div>
-          <button type="button" class="ghost-btn small-btn mobile-only" @click="closePanels">
-            Close
-          </button>
+          <div class="panel-head-actions">
+            <button type="button" class="ghost-btn small-btn desktop-only" @click="toggleLeftPanelExpanded">
+              {{ leftPanelExpanded ? "Exit full screen" : "Expand" }}
+            </button>
+            <button type="button" class="ghost-btn small-btn mobile-only" @click="closePanels">
+              Close
+            </button>
+          </div>
         </div>
 
         <article class="block user-block">
@@ -2094,6 +2720,185 @@ watch(
             </button>
           </div>
           <div class="admin-section">
+            <article class="admin-team-card">
+              <div class="section-head compact-head">
+                <div>
+                  <h4>Backup and restore</h4>
+                  <p class="muted">Export all local data and media, or restore from a previous backup.</p>
+                </div>
+              </div>
+              <div class="admin-backup-grid">
+                <section class="admin-backup-pane">
+                  <p class="muted">Create a full backup file for safe storage.</p>
+                  <div class="action-row">
+                    <button
+                      class="primary-btn"
+                      type="button"
+                      :disabled="backupExportBusy || backupImportBusy"
+                      @click="exportBackup"
+                    >
+                      {{ backupExportBusy ? "Exporting..." : "Export backup" }}
+                    </button>
+                  </div>
+                </section>
+                <section class="admin-backup-pane">
+                  <label>
+                    Backup file (.json)
+                    <input
+                      ref="backupImportInputRef"
+                      type="file"
+                      accept=".json,application/json"
+                      :disabled="backupImportBusy || backupExportBusy"
+                      @change="onBackupFileChange"
+                    />
+                  </label>
+                  <div class="action-row">
+                    <button
+                      class="danger-btn small-btn"
+                      type="button"
+                      :disabled="backupImportBusy || backupExportBusy || !backupImportFile"
+                      @click="importBackup"
+                    >
+                      {{ backupImportBusy ? "Restoring..." : "Import and restore" }}
+                    </button>
+                  </div>
+                  <p class="muted admin-backup-warning">
+                    Restore replaces all current records and media files, then signs out this session.
+                  </p>
+                </section>
+              </div>
+            </article>
+
+            <article class="admin-team-card">
+              <div class="section-head compact-head">
+                <div>
+                  <h4>Inspection checklist templates</h4>
+                  <p class="muted">Define checklist keys once and auto-seed them into new inspections.</p>
+                </div>
+                <button
+                  class="ghost-btn small-btn"
+                  type="button"
+                  :disabled="checklistTemplateBusy"
+                  @click="loadChecklistTemplates"
+                >
+                  {{ checklistTemplateBusy ? "Refreshing..." : "Refresh" }}
+                </button>
+              </div>
+
+              <div class="form-grid compact-grid">
+                <label>
+                  Item key
+                  <input
+                    v-model="newChecklistTemplateForm.item_key"
+                    :disabled="checklistTemplateBusy"
+                    placeholder="fire_extinguisher"
+                    @keydown.enter.prevent="createChecklistTemplate"
+                  />
+                </label>
+                <label>
+                  Label
+                  <input
+                    v-model="newChecklistTemplateForm.item_label"
+                    :disabled="checklistTemplateBusy"
+                    placeholder="Fire extinguisher"
+                    @keydown.enter.prevent="createChecklistTemplate"
+                  />
+                </label>
+                <label>
+                  Sort order
+                  <input
+                    v-model="newChecklistTemplateForm.sort_order"
+                    :disabled="checklistTemplateBusy"
+                    type="number"
+                    min="0"
+                    placeholder="10"
+                    @keydown.enter.prevent="createChecklistTemplate"
+                  />
+                </label>
+              </div>
+              <div class="action-row">
+                <button
+                  class="primary-btn small-btn"
+                  type="button"
+                  :disabled="
+                    checklistTemplateBusy ||
+                    !String(newChecklistTemplateForm.item_key || '').trim() ||
+                    !String(newChecklistTemplateForm.item_label || '').trim()
+                  "
+                  @click="createChecklistTemplate"
+                >
+                  {{ checklistTemplateBusy ? "Saving..." : "Add checklist item" }}
+                </button>
+              </div>
+
+              <div v-if="checklistTemplateBusy && checklistTemplateDirectory.length === 0" class="empty">
+                Loading checklist templates...
+              </div>
+              <div v-else-if="checklistTemplateDirectory.length === 0" class="empty">
+                No checklist templates configured yet.
+              </div>
+              <div v-else class="admin-checklist-list">
+                <article
+                  v-for="item in checklistTemplateDirectory"
+                  :key="item.id"
+                  class="admin-team-card nested-card admin-checklist-row"
+                >
+                  <div class="form-grid compact-grid admin-checklist-fields">
+                    <label>
+                      Item key
+                      <input
+                        v-model="checklistTemplateKeyDrafts[item.id]"
+                        :disabled="
+                          checklistTemplateSaveBusyId === item.id || checklistTemplateDeleteBusyId === item.id
+                        "
+                        placeholder="item_key"
+                      />
+                    </label>
+                    <label>
+                      Label
+                      <input
+                        v-model="checklistTemplateLabelDrafts[item.id]"
+                        :disabled="
+                          checklistTemplateSaveBusyId === item.id || checklistTemplateDeleteBusyId === item.id
+                        "
+                        placeholder="Item label"
+                      />
+                    </label>
+                    <label>
+                      Sort order
+                      <input
+                        v-model="checklistTemplateOrderDrafts[item.id]"
+                        :disabled="
+                          checklistTemplateSaveBusyId === item.id || checklistTemplateDeleteBusyId === item.id
+                        "
+                        type="number"
+                        min="0"
+                        placeholder="0"
+                      />
+                    </label>
+                  </div>
+                  <div class="action-row">
+                    <button
+                      class="primary-btn small-btn"
+                      type="button"
+                      :disabled="checklistTemplateSaveBusyId === item.id || !hasChecklistTemplateChanged(item)"
+                      @click="saveChecklistTemplate(item.id)"
+                    >
+                      {{ checklistTemplateSaveBusyId === item.id ? "Saving..." : "Save" }}
+                    </button>
+                    <button
+                      class="danger-btn small-btn"
+                      type="button"
+                      :disabled="checklistTemplateDeleteBusyId === item.id || checklistTemplateSaveBusyId === item.id"
+                      @click="deleteChecklistTemplate(item)"
+                    >
+                      {{ checklistTemplateDeleteBusyId === item.id ? "Deleting..." : "Delete" }}
+                    </button>
+                  </div>
+                </article>
+              </div>
+            </article>
+
             <article class="admin-team-card">
               <div class="section-head compact-head">
                 <div>
@@ -2376,12 +3181,21 @@ watch(
         </article>
       </aside>
 
-      <main class="map-stage">
+      <button
+        v-if="showPanelResizers"
+        type="button"
+        :class="['panel-resizer', 'left-resizer', { active: panelResizeState.side === 'left' }]"
+        aria-label="Resize left panel"
+        @mousedown="startPanelResize('left', $event)"
+      />
+
+      <main :class="['map-stage', { expanded: mapExpanded }]">
         <InspectionMap
           :inspections="mapInspections"
           :overlays="masterMapOverlays"
           :teams="teamDirectory"
           :selected-inspection-id="selectedInspectionId"
+          :map-only-active="mapExpanded"
           :busy="appBusy || inspectionBusy || mapBusy"
           :create-placement-active="createPlacementActive"
           :create-placement-kind="createPlacementKind"
@@ -2397,19 +3211,41 @@ watch(
           @pick-create-location="setCreateLocation"
           @pick-create-area="setCreateArea"
           @cancel-create-location="cancelCreatePlacement"
+          @toggle-map-only="toggleMapExpanded"
         />
       </main>
 
-      <aside :class="['panel', 'right-panel', { open: rightPanelOpen }]">
+      <button
+        v-if="showPanelResizers"
+        type="button"
+        :class="['panel-resizer', 'right-resizer', { active: panelResizeState.side === 'right' }]"
+        aria-label="Resize right panel"
+        @mousedown="startPanelResize('right', $event)"
+      />
+
+      <aside
+        v-show="!mapExpanded"
+        :class="['panel', 'right-panel', { open: rightPanelOpen, expanded: rightPanelExpanded && selectedInspectionId }]"
+      >
         <div class="panel-head">
           <div>
             <p class="eyebrow">Inspection Detail</p>
             <h2 v-if="selectedInspectionId">{{ selectedInspection?.site_name || "Inspection" }}</h2>
             <h2 v-else>Select inspection</h2>
           </div>
-          <button type="button" class="ghost-btn small-btn mobile-only" @click="closePanels">
-            Close
-          </button>
+          <div class="panel-head-actions">
+            <button
+              v-if="selectedInspectionId"
+              type="button"
+              class="ghost-btn small-btn desktop-only"
+              @click="toggleRightPanelExpanded"
+            >
+              {{ rightPanelExpanded ? "Exit full screen" : "Expand" }}
+            </button>
+            <button type="button" class="ghost-btn small-btn mobile-only" @click="closePanels">
+              Close
+            </button>
+          </div>
         </div>
 
         <template v-if="!selectedInspectionId">
@@ -2432,7 +3268,7 @@ watch(
               <button
                 class="primary-btn"
                 type="button"
-                :disabled="!canSubmitFromCurrentStatus || inspectionBusy"
+                :disabled="!canSubmitFromCurrentStatus || inspectionBusy || inspectionDeleteBusy"
                 @click="submitInspection"
               >
                 Submit
@@ -2440,10 +3276,19 @@ watch(
               <button
                 class="ghost-btn"
                 type="button"
-                :disabled="inspectionBusy"
+                :disabled="inspectionBusy || inspectionDeleteBusy"
                 @click="loadInspectionWorkspace(selectedInspectionId)"
               >
                 Refresh
+              </button>
+              <button
+                v-if="isAdminUser"
+                class="danger-btn"
+                type="button"
+                :disabled="inspectionBusy || inspectionDeleteBusy"
+                @click="deleteInspectionAsAdmin"
+              >
+                {{ inspectionDeleteBusy ? "Deleting..." : "Delete inspection" }}
               </button>
             </div>
           </article>
@@ -2513,15 +3358,38 @@ watch(
           <article v-else-if="activeTab === 'checklist'" class="block">
             <div class="section-head">
               <h3>Checklist</h3>
-              <span :class="resultChipClass(checklistOverallResult)">Overall: {{ checklistOverallResult }}</span>
+              <div class="checklist-head-actions">
+                <span :class="resultChipClass(checklistOverallResult)">Overall: {{ checklistOverallResult }}</span>
+                <button
+                  class="ghost-btn small-btn"
+                  type="button"
+                  :disabled="!canUpdateChecklist || checklistTemplateApplyBusy || checklistBusy"
+                  @click="applyChecklistTemplatesToInspection"
+                >
+                  {{ checklistTemplateApplyBusy ? "Applying..." : "Add template items" }}
+                </button>
+              </div>
             </div>
 
             <form class="form-grid compact-grid" @submit.prevent="upsertChecklistItem">
+              <label class="span-2">
+                Template item
+                <select
+                  v-model="checklistTemplateSelection"
+                  :disabled="!canUpdateChecklist || checklistBusy || checklistTemplateDirectory.length === 0"
+                  @change="applyChecklistTemplateSelection"
+                >
+                  <option value="">Select checklist template</option>
+                  <option v-for="template in checklistTemplateDirectory" :key="template.id" :value="template.item_key">
+                    {{ template.item_label }} ({{ template.item_key }})
+                  </option>
+                </select>
+              </label>
               <label>
                 Item key
                 <input
                   v-model="checklistForm.item_key"
-                  :disabled="!canUpdateChecklist || checklistBusy"
+                  :disabled="!canUpdateChecklist || checklistBusy || checklistTemplateApplyBusy"
                   placeholder="fire_extinguisher"
                   required
                 />
@@ -2530,7 +3398,7 @@ watch(
                 Label
                 <input
                   v-model="checklistForm.item_label"
-                  :disabled="!canUpdateChecklist || checklistBusy"
+                  :disabled="!canUpdateChecklist || checklistBusy || checklistTemplateApplyBusy"
                   placeholder="Fire extinguisher"
                 />
               </label>
@@ -2538,13 +3406,16 @@ watch(
                 Response value
                 <input
                   v-model="checklistForm.response_value"
-                  :disabled="!canUpdateChecklist || checklistBusy"
+                  :disabled="!canUpdateChecklist || checklistBusy || checklistTemplateApplyBusy"
                   placeholder="Optional value"
                 />
               </label>
               <label>
                 Result
-                <select v-model="checklistForm.result" :disabled="!canUpdateChecklist || checklistBusy">
+                <select
+                  v-model="checklistForm.result"
+                  :disabled="!canUpdateChecklist || checklistBusy || checklistTemplateApplyBusy"
+                >
                   <option value="pass">Pass</option>
                   <option value="fail">Fail</option>
                   <option value="na">N/A</option>
@@ -2554,11 +3425,15 @@ watch(
                 Comment
                 <input
                   v-model="checklistForm.comment"
-                  :disabled="!canUpdateChecklist || checklistBusy"
+                  :disabled="!canUpdateChecklist || checklistBusy || checklistTemplateApplyBusy"
                   placeholder="Issue details or remediation"
                 />
               </label>
-              <button class="primary-btn" type="submit" :disabled="!canUpdateChecklist || checklistBusy">
+              <button
+                class="primary-btn"
+                type="submit"
+                :disabled="!canUpdateChecklist || checklistBusy || checklistTemplateApplyBusy"
+              >
                 {{ checklistBusy ? "Saving..." : "Save item" }}
               </button>
             </form>
@@ -2756,6 +3631,8 @@ html,
 body,
 #app {
   margin: 0;
+  width: 100%;
+  height: 100%;
   min-height: 100%;
 }
 
@@ -2766,12 +3643,19 @@ body {
     radial-gradient(1100px 520px at 94% -12%, #154969 0%, transparent 60%),
     radial-gradient(820px 440px at -12% 112%, #8a4d1f 0%, transparent 58%),
     var(--bg-page);
+  overflow: hidden;
 }
 
 .gis-app {
-  max-width: 1800px;
-  margin: 0 auto;
+  width: 100%;
+  max-width: none;
+  margin: 0;
   padding: 14px;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .topbar {
@@ -2856,7 +3740,9 @@ code {
   display: grid;
   grid-template-columns: 1.2fr minmax(300px, 460px);
   gap: 12px;
-  min-height: 420px;
+  flex: 1;
+  height: 100%;
+  min-height: 0;
 }
 
 .auth-story,
@@ -2865,6 +3751,7 @@ code {
   border: 1px solid var(--line-soft);
   background: linear-gradient(154deg, rgba(20, 48, 69, 0.92), rgba(11, 28, 41, 0.96));
   padding: 16px;
+  overflow: auto;
 }
 
 .auth-story h2 {
@@ -2898,15 +3785,62 @@ code {
 
 .password-card {
   max-width: 650px;
+  flex: 1;
+  min-height: 0;
 }
 
 .workspace {
+  --workspace-left: 340px;
+  --workspace-right: 420px;
+  --workspace-resizer: 10px;
   display: grid;
-  grid-template-columns: minmax(280px, 320px) minmax(0, 1fr) minmax(310px, 420px);
+  grid-template-columns:
+    minmax(260px, var(--workspace-left))
+    var(--workspace-resizer)
+    minmax(0, 1fr)
+    var(--workspace-resizer)
+    minmax(300px, var(--workspace-right));
   gap: 12px;
-  height: calc(100vh - 122px);
-  height: calc(100dvh - 122px);
-  min-height: 680px;
+  flex: 1;
+  height: 100%;
+  min-height: 0;
+}
+
+.workspace.map-only {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.panel-resizer {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  cursor: col-resize;
+  padding: 0;
+  position: relative;
+  z-index: 6;
+  touch-action: none;
+}
+
+.panel-resizer::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 2px;
+  border-radius: 999px;
+  background: rgba(71, 113, 142, 0.72);
+}
+
+.panel-resizer:hover::before,
+.panel-resizer.active::before {
+  width: 3px;
+  background: rgba(102, 188, 219, 0.95);
 }
 
 .mobile-dock {
@@ -2917,6 +3851,15 @@ code {
   border-color: #3cb6c9;
   background: #1a4762;
   color: #f2fbff;
+}
+
+.popup-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 880;
+  border: 0;
+  background: rgba(5, 14, 22, 0.42);
+  cursor: pointer;
 }
 
 .panel {
@@ -2935,8 +3878,18 @@ code {
   margin-bottom: 10px;
 }
 
+.panel-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .mobile-only {
   display: none;
+}
+
+.desktop-only {
+  display: inline-flex;
 }
 
 .block {
@@ -2953,12 +3906,41 @@ code {
   align-content: start;
 }
 
+.left-panel.expanded,
+.right-panel.expanded {
+  position: fixed;
+  top: max(10px, env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(1460px, calc(100vw - max(14px, env(safe-area-inset-left)) - max(14px, env(safe-area-inset-right))));
+  height: min(72vh, 860px);
+  max-height: min(72vh, 860px);
+  z-index: 900;
+  box-shadow: 0 28px 72px rgba(0, 0, 0, 0.46);
+}
+
+.left-panel.expanded,
+.right-panel.expanded {
+  overflow: auto;
+}
+
 .map-stage {
   position: relative;
+  z-index: 1;
   border: 1px solid #1f3b52;
   border-radius: var(--radius-lg);
   overflow: hidden;
   background: #0d2232;
+  min-height: 0;
+}
+
+.workspace.map-only .map-stage {
+  grid-column: 1 / -1;
+  height: 100%;
+}
+
+.map-stage.expanded {
+  z-index: 2;
 }
 
 .user-row {
@@ -3217,6 +4199,42 @@ button:disabled {
   gap: 8px;
 }
 
+.admin-backup-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.admin-backup-pane {
+  border: 1px solid #35546d;
+  border-radius: 10px;
+  background: #0f2434;
+  padding: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.admin-backup-pane p {
+  margin: 0;
+}
+
+.admin-backup-warning {
+  font-size: 0.76rem;
+}
+
+.admin-checklist-list {
+  display: grid;
+  gap: 8px;
+}
+
+.admin-checklist-row {
+  gap: 8px;
+}
+
+.admin-checklist-fields {
+  align-items: end;
+}
+
 .nested-card {
   background: #0f2434;
 }
@@ -3408,6 +4426,14 @@ button:disabled {
   gap: 6px;
 }
 
+.checklist-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+}
+
 .tab-strip {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -3513,7 +4539,12 @@ th {
 
 @media (max-width: 1300px) {
   .workspace {
-    grid-template-columns: minmax(260px, 300px) minmax(0, 1fr) minmax(290px, 380px);
+    grid-template-columns:
+      minmax(240px, var(--workspace-left))
+      var(--workspace-resizer)
+      minmax(0, 1fr)
+      var(--workspace-resizer)
+      minmax(280px, var(--workspace-right));
   }
 
   .tab-strip {
@@ -3528,11 +4559,14 @@ th {
 
   .workspace {
     grid-template-columns: 1fr;
-    min-height: 540px;
-    height: calc(100vh - 136px);
-    height: calc(100dvh - 136px);
+    min-height: 0;
+    height: 100%;
     position: relative;
     padding-bottom: calc(78px + env(safe-area-inset-bottom));
+  }
+
+  .panel-resizer {
+    display: none;
   }
 
   .mobile-dock {
@@ -3542,7 +4576,7 @@ th {
     right: max(8px, env(safe-area-inset-right));
     bottom: max(10px, env(safe-area-inset-bottom));
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 6px;
     padding: 8px;
     border: 1px solid rgba(41, 68, 92, 0.92);
@@ -3552,8 +4586,16 @@ th {
     box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
   }
 
+  .popup-backdrop {
+    display: none;
+  }
+
   .mobile-only {
     display: inline-flex;
+  }
+
+  .desktop-only {
+    display: none;
   }
 
   .left-panel,
@@ -3571,6 +4613,21 @@ th {
     transition: transform 180ms ease, opacity 180ms ease;
     box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
     transform: translateY(18px);
+  }
+
+  .left-panel.expanded,
+  .right-panel.expanded {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    bottom: calc(78px + env(safe-area-inset-bottom));
+    z-index: 190;
+    width: auto;
+    height: auto;
+    max-height: none;
+    transform: translateY(18px);
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
   }
 
   .left-panel.open,
@@ -3626,6 +4683,10 @@ th {
   }
 
   .admin-user-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-backup-grid {
     grid-template-columns: 1fr;
   }
 

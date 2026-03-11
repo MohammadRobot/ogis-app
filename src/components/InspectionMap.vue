@@ -20,6 +20,10 @@ const props = defineProps({
     type: Number,
     default: null,
   },
+  mapOnlyActive: {
+    type: Boolean,
+    default: false,
+  },
   createPlacementActive: {
     type: Boolean,
     default: false,
@@ -46,6 +50,7 @@ const emit = defineEmits([
   "pick-create-location",
   "pick-create-area",
   "cancel-create-location",
+  "toggle-map-only",
 ]);
 
 const DEFAULT_VIEW = [25.2048, 55.2708];
@@ -54,6 +59,8 @@ const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
 ];
+const NOMINATIM_SEARCH_ENDPOINT = "https://nominatim.openstreetmap.org/search";
+const MAX_SEARCH_RESULTS = 5;
 
 const OSM_CATEGORY_FILTERS = {
   all: [
@@ -94,6 +101,7 @@ const OSM_CATEGORY_OPTIONS = [
   { value: "transport", label: "Transport" },
   { value: "infrastructure", label: "Infrastructure" },
 ];
+const TOOL_NOTICE_AUTO_HIDE_MS = 3000;
 
 const mapEl = ref(null);
 const activeMode = ref("none");
@@ -120,16 +128,30 @@ const osm = reactive({
   lastUpdated: "",
   limitNotice: "",
 });
+const mapSearch = reactive({
+  query: "",
+  busy: false,
+  results: [],
+});
 
 let map = null;
 let inspectionLayer = null;
 let overlayLayer = null;
 let osmLayer = null;
 let draftLayer = null;
+let searchResultMarker = null;
 let hasAutoFit = false;
 let moveDebounceTimer = null;
 let osmAbortController = null;
 let lastOsmQueryKey = "";
+let toolNoticeTimer = null;
+
+function clearToolNoticeTimer() {
+  if (toolNoticeTimer) {
+    clearTimeout(toolNoticeTimer);
+    toolNoticeTimer = null;
+  }
+}
 
 function invalidateMapSize() {
   if (!map) return;
@@ -230,18 +252,25 @@ function closeDrawer() {
 }
 
 function clearToolMessages() {
+  clearToolNoticeTimer();
   toolError.value = "";
   toolNotice.value = "";
 }
 
 function setToolError(message) {
+  clearToolNoticeTimer();
   toolError.value = message;
   toolNotice.value = "";
 }
 
 function setToolNotice(message) {
+  clearToolNoticeTimer();
   toolNotice.value = message;
   toolError.value = "";
+  toolNoticeTimer = setTimeout(() => {
+    toolNotice.value = "";
+    toolNoticeTimer = null;
+  }, TOOL_NOTICE_AUTO_HIDE_MS);
 }
 
 function escapeHtml(value) {
@@ -853,6 +882,113 @@ function requestOverlayDelete(overlayId) {
   emit("delete-overlay", Number(overlayId));
 }
 
+function clearSearchMarker() {
+  if (searchResultMarker && map) {
+    map.removeLayer(searchResultMarker);
+  }
+  searchResultMarker = null;
+}
+
+function focusSearchResult(result) {
+  if (!map || !result) return;
+
+  const latitude = Number(result.lat);
+  const longitude = Number(result.lng);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+
+  clearSearchMarker();
+  searchResultMarker = L.circleMarker([latitude, longitude], {
+    pane: "overlayPane",
+    radius: 8,
+    weight: 2,
+    color: "#ffffff",
+    fillColor: "#f29f4b",
+    fillOpacity: 0.95,
+  }).addTo(map);
+  searchResultMarker.bindPopup(
+    `<div class="osm-popup"><h4>Search result</h4><p>${escapeHtml(result.label || "Location")}</p></div>`,
+    { maxWidth: 320 }
+  );
+  searchResultMarker.openPopup();
+
+  map.flyTo([latitude, longitude], Math.max(map.getZoom(), 14), {
+    duration: 0.7,
+  });
+}
+
+function clearMapSearchResults() {
+  mapSearch.results = [];
+  clearSearchMarker();
+}
+
+async function searchMapLocation() {
+  if (!map) return;
+
+  const query = String(mapSearch.query || "").trim();
+  if (!query) {
+    setToolError("Type a place name or address to search.");
+    return;
+  }
+
+  clearToolMessages();
+  mapSearch.busy = true;
+
+  try {
+    const params = new URLSearchParams({
+      format: "jsonv2",
+      q: query,
+      limit: String(MAX_SEARCH_RESULTS),
+      addressdetails: "1",
+    });
+
+    const response = await fetch(`${NOMINATIM_SEARCH_ENDPOINT}?${params.toString()}`, {
+      headers: {
+        Accept: "application/json",
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`Search service returned HTTP ${response.status}.`);
+    }
+
+    const payload = await response.json();
+    const results = Array.isArray(payload)
+      ? payload
+          .map((entry, index) => {
+            const latitude = Number(entry?.lat);
+            const longitude = Number(entry?.lon);
+            const label = String(entry?.display_name || "").trim();
+            if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || !label) return null;
+
+            const parts = label.split(",").map((part) => part.trim()).filter(Boolean);
+            return {
+              id: String(entry?.place_id || `${index}`),
+              lat: latitude,
+              lng: longitude,
+              label,
+              title: parts[0] || label,
+              subtitle: parts.slice(1).join(", "),
+            };
+          })
+          .filter(Boolean)
+      : [];
+
+    if (results.length === 0) {
+      clearMapSearchResults();
+      setToolError("No matching location found. Try another search term.");
+      return;
+    }
+
+    mapSearch.results = results;
+    focusSearchResult(results[0]);
+    setToolNotice(`Found ${results.length} location${results.length === 1 ? "" : "s"}.`);
+  } catch (error) {
+    clearMapSearchResults();
+    setToolError(String(error?.message || "Could not search location."));
+  } finally {
+    mapSearch.busy = false;
+  }
+}
+
 function fitAllData() {
   if (!ensureMapReady()) return;
 
@@ -1202,14 +1338,36 @@ onMounted(async () => {
   map.createPane("draftPane");
   map.getPane("draftPane").style.zIndex = 500;
 
+  const osmAttribution = "&copy; OpenStreetMap contributors";
+
   const osmStandard = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
-    attribution: "&copy; OpenStreetMap contributors",
+    attribution: osmAttribution,
   });
 
   const osmHumanitarian = L.tileLayer("https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png", {
     maxZoom: 19,
-    attribution: "&copy; OpenStreetMap contributors, Humanitarian style",
+    attribution: `${osmAttribution}, Humanitarian style`,
+  });
+
+  const osmFrance = L.tileLayer("https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png", {
+    maxZoom: 20,
+    attribution: `${osmAttribution}, style by OpenStreetMap France`,
+  });
+
+  const osmGermany = L.tileLayer("https://tile.openstreetmap.de/{z}/{x}/{y}.png", {
+    maxZoom: 18,
+    attribution: `${osmAttribution}, style by openstreetmap.de`,
+  });
+
+  const osmCyclOSM = L.tileLayer("https://{s}.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png", {
+    maxZoom: 20,
+    attribution: `${osmAttribution}, style by CyclOSM`,
+  });
+
+  const osmTopo = L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", {
+    maxZoom: 17,
+    attribution: `${osmAttribution}, SRTM | OpenTopoMap`,
   });
 
   osmStandard.addTo(map);
@@ -1224,6 +1382,10 @@ onMounted(async () => {
       {
         "OSM Standard": osmStandard,
         "OSM Humanitarian": osmHumanitarian,
+        "OSM France": osmFrance,
+        "OSM Germany": osmGermany,
+        CyclOSM: osmCyclOSM,
+        OpenTopoMap: osmTopo,
       },
       {
         Inspections: inspectionLayer,
@@ -1337,6 +1499,8 @@ watch(
 onBeforeUnmount(() => {
   window.removeEventListener("resize", invalidateMapSize);
   window.removeEventListener("orientationchange", invalidateMapSize);
+  clearToolNoticeTimer();
+  clearSearchMarker();
 
   if (moveDebounceTimer) {
     clearTimeout(moveDebounceTimer);
@@ -1358,6 +1522,7 @@ onBeforeUnmount(() => {
   overlayLayer = null;
   osmLayer = null;
   draftLayer = null;
+  searchResultMarker = null;
 });
 </script>
 
@@ -1431,6 +1596,17 @@ onBeforeUnmount(() => {
     <div class="map-toolbar toolbar-right">
       <div class="toolbar-group">
         <button type="button" class="tool-btn" @click="fitAllData">Fit</button>
+        <button
+          type="button"
+          :class="['tool-btn', { active: activeDrawer === 'search' }]"
+          :disabled="createPlacementActive"
+          @click="toggleDrawer('search')"
+        >
+          Search
+        </button>
+        <button type="button" :class="['tool-btn', { active: mapOnlyActive }]" @click="$emit('toggle-map-only')">
+          {{ mapOnlyActive ? "Exit map only" : "Map only" }}
+        </button>
         <button type="button" class="tool-btn" :disabled="areaBoundaryCount === 0" @click="fitAreaBoundaries">
           Areas
         </button>
@@ -1447,6 +1623,45 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </div>
+
+    <section v-if="activeDrawer === 'search'" class="map-drawer right">
+      <article class="hud-card">
+        <div class="drawer-head">
+          <div>
+            <p class="drawer-eyebrow">Map Search</p>
+            <h4>Find place or address</h4>
+          </div>
+          <button type="button" class="tool-btn muted" @click="closeDrawer">Close</button>
+        </div>
+        <form class="map-search-form" @submit.prevent="searchMapLocation">
+          <label>
+            Search term
+            <input
+              v-model.trim="mapSearch.query"
+              :disabled="mapSearch.busy"
+              placeholder="Search by name, place, or address"
+            />
+          </label>
+          <div class="hud-actions">
+            <button type="submit" class="tool-btn" :disabled="mapSearch.busy || !mapSearch.query.trim()">
+              {{ mapSearch.busy ? "Searching..." : "Search" }}
+            </button>
+            <button type="button" class="tool-btn muted" :disabled="mapSearch.busy" @click="clearMapSearchResults">
+              Clear
+            </button>
+          </div>
+        </form>
+        <p v-if="mapSearch.results.length === 0" class="hud-meta">No search results yet.</p>
+        <ul v-else class="search-results">
+          <li v-for="result in mapSearch.results" :key="result.id">
+            <button type="button" class="tool-btn muted search-result-btn" @click="focusSearchResult(result)">
+              <strong>{{ result.title }}</strong>
+              <span>{{ result.subtitle || result.label }}</span>
+            </button>
+          </li>
+        </ul>
+      </article>
+    </section>
 
     <section v-if="activeDrawer === 'layers'" class="map-drawer left">
       <article class="hud-card">
@@ -1649,6 +1864,7 @@ onBeforeUnmount(() => {
   padding: 8px 10px;
   font-size: 13px;
   max-width: 560px;
+  pointer-events: none;
 }
 
 .floating-banner.error {
@@ -1795,6 +2011,38 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
+}
+
+.map-search-form {
+  display: grid;
+  gap: 8px;
+}
+
+.search-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.search-result-btn {
+  width: 100%;
+  text-align: left;
+  display: grid;
+  gap: 2px;
+}
+
+.search-result-btn strong {
+  font-size: 0.8rem;
+  color: #ecf5ff;
+}
+
+.search-result-btn span {
+  font-size: 0.72rem;
+  color: #a5c2d8;
 }
 
 .mode-grid {

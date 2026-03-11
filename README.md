@@ -1,84 +1,138 @@
-# [www.ogis.app](http://www.ogis.app)
+# OGIS Inspection App
 
-The free, Open-Source app for creating and editing meaningful maps in the browser.
+Local-network web app for field inspections with:
 
-![Screenshot of OGIS App](https://www.ogis.app/assets/img/ogis-screenshot.png)
+- Map-first inspection management
+- Checklist/media/review workflow
+- Admin backup/restore
+- Local SQLite backend (no cloud dependency)
 
-## Features
+## Stack
 
-### 🗺️ **Interactive Map Creation**
+- Frontend: Vue 3 + Vite + Leaflet
+- Backend: Express + SQLite (`better-sqlite3`)
 
-Create stunning, interactive maps with custom Markers, Lines, and Shapes.
+## Requirements
 
-### 📍 **Custom Markers, Lines & Shapes**
+- Node.js 20+ (required)
+- npm 9+
+- Linux/macOS (or Windows with WSL recommended)
 
-- **Markers**: Add custom point Markers with configurable icons, colours, and sizes
-- **Lines**: Draw routes, paths, and boundaries with customizable styles
-- **Shapes**: Create areas, regions, and polygons with fill colours
+The project uses `./bin/ogis-node` to force a Node 20+ binary for both frontend and backend scripts.
 
-### 🎨 **Flexible Type System**
-
-Define and customize Marker, Line, and Shape Types with:
-
-- Custom titles and descriptions
-- Icon custimisation using text, Emojis and [Ionic Icons](https://ionic.io/ionicons/v2/cheatsheet.html) & [Font Awesome](https://fontawesome.com/v4.7.0/cheatsheet/) libraries
-- Colour customization for Markers, Lines, and fills
-- Size and style options
-- Real-time preview of changes
-
-### 💾 **Import & Export Functionality**
-
-- **Import**: Load existing GeoJSON files to continue working on maps
-- **Export**: Download your complete map data including:
-  - All map features (Markers, Lines, Shapes)
-  - Custom Type configurations
-  - Map settings and styling
-  - Timestamped filenames (e.g., `ogis-map-2025-06-26-11-17.geojson`)
-
-### 🔄 **Undo/Redo System**
-
-Full history tracking allows you to:
-
-- Undo and redo any changes
-- Experiment with confidence
-- Revert to previous states
-
-## Use Cases
-
-- **Route Planning**: Create detailed travel routes with waypoints
-- **Property Mapping**: Mark boundaries, features, and points of interest
-- **Event Planning**: Map venues, parking, and logistics
-- **Educational Maps**: Create interactive learning materials
-- **Business Mapping**: Show locations, territories, and service areas
-- **Personal Projects**: Document travels, hiking trails, or local discoveries
-
-## Export & Data Portability
-
-The export feature is designed for maximum compatibility and future-proofing:
-
-- **Complete Data Export**: Your exported file contains everything needed to recreate your map exactly as you designed it
-- **Standard Format**: Uses GeoJSON format, compatible with most mapping applications
-- **Configuration Included**: All custom Types, colours, and settings are preserved
-
-### Development
-
-> [!NOTE]
-> To develop locally you will need to have both Node.js and NPM [installed](https://docs.npmjs.com/downloading-and-installing-node-js-and-npm).
+## Fresh Installation
 
 ```bash
-# Clone the repository (and the Waymark JS submodule)
-git clone --recurse-submodules https://github.com/OpenGIS/ogis-app
-
-# Navigate to the Waymark directory
+git clone <your-repo-url> ogis-app
 cd ogis-app
 
-# Install the dependencies (or pnpm/yarn install)
+# Frontend dependencies
 npm install
 
-# Run the development server (using Vite)
+# Backend dependencies
+cd server
+npm install
+cd ..
+```
+
+## Development Run
+
+Run backend and frontend in separate terminals.
+
+Terminal 1:
+```bash
+cd server
 npm run dev
 ```
 
-Open the provided `localhost` URL in your browser to view the app. Changes will automatically reload.
+Terminal 2:
+```bash
+cd /path/to/ogis-app
+npm run dev
+```
 
-Pull requests are welcome!
+Open:
+
+- Frontend: `http://localhost:5173`
+- API health: `http://localhost:8787/api/health`
+
+LAN access (phone/other PC on same network):
+
+- Frontend: `http://<your-pc-ip>:5173`
+- Backend: `http://<your-pc-ip>:8787`
+
+Make sure OS firewall allows inbound TCP on `5173` and `8787`.
+
+## Default Seed Accounts
+
+Created on first backend start:
+
+- `admin` / `local-seed`
+- `supervisor1` / `local-seed`
+- `inspector1` / `local-seed`
+- `inspector2` / `local-seed`
+
+Password change is required after first login.
+
+## Production Build + Run
+
+### 1) Build frontend
+
+```bash
+cd /path/to/ogis-app
+npm run build
+```
+
+This generates static files in `dist/`.
+
+### 2) Run backend in production mode
+
+```bash
+cd /path/to/ogis-app/server
+HOST=127.0.0.1 PORT=8787 npm run start
+```
+
+Important backend environment variables:
+
+- `HOST` (default `0.0.0.0`)
+- `PORT` (default `8787`)
+- `OGIS_DATA_DIR` (default `server/data`)
+- `OGIS_DB_FILE` (default `<OGIS_DATA_DIR>/ogis-local.sqlite`)
+- `OGIS_CORS_ALLOWED_ORIGINS` (comma-separated origins)
+
+### 3) Serve `dist/` and proxy `/api` to backend
+
+Example Nginx server block:
+
+```nginx
+server {
+    listen 80;
+    server_name _;
+
+    root /opt/ogis-app/dist;
+    index index.html;
+
+    location / {
+        try_files $uri /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+## Data and Backups
+
+- Database and media are stored under `server/data/` by default.
+- Admin panel supports export/import backup for full restore.
+- Include `server/data/` in your system backup policy.
+
+## Notes
+
+- This repository is cleaned for the current inspection workflow.
+- Legacy Waymark editor assets/components were removed because they are not used by this app.

@@ -102,6 +102,20 @@ function parseGeometryJson(rawValue) {
   return parsed && typeof parsed === "object" ? parsed : null;
 }
 
+function tableExists(db, tableName) {
+  const row = db
+    .prepare(
+      `
+      SELECT 1
+      FROM sqlite_master
+      WHERE type = 'table' AND name = ?
+      LIMIT 1
+      `
+    )
+    .get(tableName);
+  return Boolean(row);
+}
+
 function normalizeLngLatPair(rawPair) {
   if (!Array.isArray(rawPair) || rawPair.length < 2) return null;
   const lng = Number(rawPair[0]);
@@ -343,6 +357,47 @@ function resolveStoragePathWithinDataDir(dataDir, storageRelPath) {
   }
 
   return absolutePath;
+}
+
+function cleanupInspectionMediaFiles(dataDir, inspectionId, mediaRows) {
+  const rows = Array.isArray(mediaRows) ? mediaRows : [];
+  const summary = {
+    total_files: rows.length,
+    deleted_files: 0,
+    missing_files: 0,
+    path_invalid_files: 0,
+    file_errors: 0,
+  };
+
+  for (const media of rows) {
+    const filePath = resolveStoragePathWithinDataDir(dataDir, media?.storage_rel_path);
+    if (!filePath) {
+      summary.path_invalid_files += 1;
+      continue;
+    }
+
+    try {
+      fs.unlinkSync(filePath);
+      summary.deleted_files += 1;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        summary.missing_files += 1;
+      } else {
+        summary.file_errors += 1;
+      }
+    }
+  }
+
+  const inspectionMediaDir = resolveStoragePathWithinDataDir(dataDir, `media/${inspectionId}`);
+  if (inspectionMediaDir) {
+    try {
+      fs.rmSync(inspectionMediaDir, { recursive: true, force: true });
+    } catch (_error) {
+      // Ignore directory cleanup failures; individual file stats are tracked above.
+    }
+  }
+
+  return summary;
 }
 
 function computeFileSha256(filePath) {
@@ -657,6 +712,53 @@ function recalculateInspectionOverallResult(db, inspectionId) {
   ).run(overallResult, inspectionId);
 
   return overallResult;
+}
+
+function seedInspectionChecklistFromTemplates(db, inspectionId) {
+  if (!Number.isFinite(inspectionId)) return 0;
+  if (!tableExists(db, "checklist_templates")) return 0;
+
+  const templates = db
+    .prepare(
+      `
+      SELECT
+        item_key,
+        item_label
+      FROM checklist_templates
+      ORDER BY sort_order ASC, item_label ASC, id ASC
+      `
+    )
+    .all();
+  if (templates.length === 0) return 0;
+
+  const insertStmt = db.prepare(
+    `
+    INSERT INTO inspection_item_responses (
+      inspection_id,
+      item_key,
+      item_label,
+      response_value,
+      result,
+      comment,
+      answered_by,
+      answered_at
+    )
+    VALUES (?, ?, ?, NULL, 'na', NULL, NULL, NULL)
+    ON CONFLICT(inspection_id, item_key) DO NOTHING
+    `
+  );
+
+  let insertedCount = 0;
+  for (const template of templates) {
+    const result = insertStmt.run(inspectionId, template.item_key, template.item_label);
+    insertedCount += Number(result?.changes || 0);
+  }
+
+  if (insertedCount > 0) {
+    recalculateInspectionOverallResult(db, inspectionId);
+  }
+
+  return insertedCount;
 }
 
 function buildTeamContextFromBody(req) {
@@ -2432,6 +2534,7 @@ router.post(
 
     let createdInspectionId = null;
     let inspectionNo = null;
+    let seededChecklistItems = 0;
     const insertStmt = db.prepare(
       `
       INSERT INTO inspections (
@@ -2455,19 +2558,40 @@ router.post(
     for (let attempts = 0; attempts < 8; attempts += 1) {
       try {
         inspectionNo = createInspectionNumber();
-        const result = insertStmt.run(
-          inspectionNo,
-          siteName,
-          teamId,
-          assignedTo,
-          req.user.id,
-          latitude,
-          longitude,
-          geometryType,
-          geometryJson,
-          notes
-        );
-        createdInspectionId = Number(result.lastInsertRowid);
+        const created = db.transaction(() => {
+          const result = insertStmt.run(
+            inspectionNo,
+            siteName,
+            teamId,
+            assignedTo,
+            req.user.id,
+            latitude,
+            longitude,
+            geometryType,
+            geometryJson,
+            notes
+          );
+          const inspectionId = Number(result.lastInsertRowid);
+          const seededCount = seedInspectionChecklistFromTemplates(db, inspectionId);
+
+          writeAuditLog(db, req.user.id, "inspection.created", "inspections", inspectionId, {
+            inspection_no: inspectionNo,
+            team_id: teamId,
+            assigned_to: assignedTo,
+            latitude,
+            longitude,
+            geometry_type: geometryType,
+            seeded_checklist_items: seededCount,
+          });
+
+          return {
+            inspection_id: inspectionId,
+            seeded_checklist_items: seededCount,
+          };
+        })();
+
+        createdInspectionId = created.inspection_id;
+        seededChecklistItems = created.seeded_checklist_items;
         break;
       } catch (error) {
         if (String(error?.message || "").includes("UNIQUE constraint failed: inspections.inspection_no")) {
@@ -2485,16 +2609,12 @@ router.post(
     }
 
     const created = fetchInspectionById(db, createdInspectionId);
-    writeAuditLog(db, req.user.id, "inspection.created", "inspections", createdInspectionId, {
-      inspection_no: inspectionNo,
-      team_id: teamId,
-      assigned_to: assignedTo,
-      latitude,
-      longitude,
-      geometry_type: geometryType,
+    res.status(201).json({
+      data: created,
+      meta: {
+        seeded_checklist_items: seededChecklistItems,
+      },
     });
-
-    res.status(201).json({ data: created });
   }
 );
 
@@ -2726,6 +2846,137 @@ router.get(
     res.json({
       data: items,
       overall_result: req.inspection.overall_result ?? "na",
+    });
+  }
+);
+
+router.post(
+  "/:id/items/apply-templates",
+  requireUser,
+  requirePasswordChangeCompleted,
+  loadInspection,
+  (req, res) => {
+    const db = req.app.locals.db;
+    const inspection = req.inspection;
+    const roles = rolesFromUser(req.user);
+
+    const allowed = can(roles, "create", "inspection_item_responses", {
+      actor: req.user,
+      inspection,
+      target: { team_id: inspection.team_id },
+    });
+    if (!allowed) {
+      res.status(403).json({
+        error: "Forbidden",
+        message: "Not allowed to create item responses for this inspection",
+      });
+      return;
+    }
+
+    if (!tableExists(db, "checklist_templates")) {
+      const items = fetchInspectionItems(db, inspection.id);
+      res.json({
+        data: items,
+        overall_result: inspection.overall_result ?? "na",
+        applied_count: 0,
+      });
+      return;
+    }
+
+    const templates = db
+      .prepare(
+        `
+        SELECT
+          item_key,
+          item_label
+        FROM checklist_templates
+        ORDER BY sort_order ASC, item_label ASC, id ASC
+        `
+      )
+      .all();
+
+    if (templates.length === 0) {
+      const items = fetchInspectionItems(db, inspection.id);
+      res.json({
+        data: items,
+        overall_result: inspection.overall_result ?? "na",
+        applied_count: 0,
+      });
+      return;
+    }
+
+    const existingRows = db
+      .prepare(
+        `
+        SELECT item_key
+        FROM inspection_item_responses
+        WHERE inspection_id = ?
+        `
+      )
+      .all(inspection.id);
+    const existingKeys = new Set(existingRows.map((row) => row.item_key));
+    const missingTemplates = templates.filter((template) => !existingKeys.has(template.item_key));
+
+    if (missingTemplates.length === 0) {
+      const items = fetchInspectionItems(db, inspection.id);
+      res.json({
+        data: items,
+        overall_result: inspection.overall_result ?? "na",
+        applied_count: 0,
+      });
+      return;
+    }
+
+    const applyResult = db.transaction(() => {
+      const insertStmt = db.prepare(
+        `
+        INSERT INTO inspection_item_responses (
+          inspection_id,
+          item_key,
+          item_label,
+          response_value,
+          result,
+          comment,
+          answered_by,
+          answered_at
+        )
+        VALUES (?, ?, ?, NULL, 'na', NULL, NULL, NULL)
+        ON CONFLICT(inspection_id, item_key) DO NOTHING
+        `
+      );
+
+      let insertedCount = 0;
+      for (const template of missingTemplates) {
+        const result = insertStmt.run(inspection.id, template.item_key, template.item_label);
+        insertedCount += Number(result?.changes || 0);
+      }
+
+      const overallResult =
+        insertedCount > 0
+          ? recalculateInspectionOverallResult(db, inspection.id)
+          : inspection.overall_result ?? "na";
+      const updatedItems = fetchInspectionItems(db, inspection.id);
+
+      if (insertedCount > 0) {
+        writeAuditLog(db, req.user.id, "inspection.template_items_applied", "inspections", inspection.id, {
+          template_count: templates.length,
+          inserted_count: insertedCount,
+          item_keys: missingTemplates.map((item) => item.item_key),
+          overall_result: overallResult,
+        });
+      }
+
+      return {
+        inserted_count: insertedCount,
+        overall_result: overallResult,
+        items: updatedItems,
+      };
+    })();
+
+    res.json({
+      data: applyResult.items,
+      overall_result: applyResult.overall_result,
+      applied_count: applyResult.inserted_count,
     });
   }
 );
@@ -3260,6 +3511,65 @@ router.post(
       cleanupUploadedFile();
       throw error;
     }
+  }
+);
+
+router.delete(
+  "/:id",
+  requireUser,
+  requirePasswordChangeCompleted,
+  loadInspection,
+  (req, res) => {
+    if (!isAdminUser(req.user)) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+
+    const db = req.app.locals.db;
+    const config = req.app.locals.config;
+    const inspection = req.inspection;
+    const mediaRows = fetchInspectionMedia(db, inspection.id);
+
+    const deleted = db.transaction(() => {
+      const result = db
+        .prepare(
+          `
+          DELETE FROM inspections
+          WHERE id = ?
+          `
+        )
+        .run(inspection.id);
+
+      if (result.changes === 0) {
+        return false;
+      }
+
+      writeAuditLog(db, req.user.id, "inspection.deleted", "inspections", inspection.id, {
+        inspection_no: inspection.inspection_no,
+        site_name: inspection.site_name,
+        team_id: inspection.team_id,
+        status: inspection.status,
+        media_files: mediaRows.length,
+      });
+
+      return true;
+    })();
+
+    if (!deleted) {
+      res.status(404).json({ error: "Inspection not found" });
+      return;
+    }
+
+    const mediaCleanup = cleanupInspectionMediaFiles(config.dataDir, inspection.id, mediaRows);
+
+    res.json({
+      success: true,
+      data: {
+        id: inspection.id,
+        inspection_no: inspection.inspection_no,
+        media_cleanup: mediaCleanup,
+      },
+    });
   }
 );
 

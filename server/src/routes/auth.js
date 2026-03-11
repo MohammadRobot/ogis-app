@@ -1,3 +1,7 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import multer from "multer";
 import { Router } from "express";
 import { requirePasswordChangeCompleted, requireUser, rolesFromUser } from "../middleware/auth.js";
 import { can } from "../security/rbac.js";
@@ -7,10 +11,288 @@ import { writeAuditLog } from "../utils/audit.js";
 
 const router = Router();
 const USERNAME_PATTERN = /^[A-Za-z0-9._-]{3,32}$/;
+const CHECKLIST_TEMPLATE_KEY_PATTERN = /^[A-Za-z0-9._-]{2,64}$/;
 const USER_ROLES = new Set(["admin", "supervisor", "inspector"]);
 const DEFAULT_LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const DEFAULT_LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 8;
 const DEFAULT_LOGIN_RATE_LIMIT_LOCK_MS = 15 * 60 * 1000;
+const BACKUP_FORMAT = "ogis-local-backup";
+const BACKUP_VERSION = 1;
+const BACKUP_IMPORT_MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024;
+const BACKUP_TABLE_EXPORT_ORDER = Object.freeze([
+  "teams",
+  "users",
+  "checklist_templates",
+  "inspections",
+  "inspection_item_responses",
+  "inspection_reviews",
+  "media_files",
+  "master_map_overlays",
+  "audit_logs",
+  "query_perf_samples",
+]);
+const BACKUP_TABLE_CLEAR_ORDER = Object.freeze([
+  "auth_sessions",
+  "login_rate_limits",
+  "query_perf_samples",
+  "media_files",
+  "inspection_reviews",
+  "inspection_item_responses",
+  "master_map_overlays",
+  "audit_logs",
+  "inspections",
+  "checklist_templates",
+  "users",
+  "teams",
+]);
+const BACKUP_IMPORT_UPLOAD = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: 1,
+    fileSize: BACKUP_IMPORT_MAX_FILE_SIZE_BYTES,
+  },
+});
+
+class BackupValidationError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.name = "BackupValidationError";
+    this.status = status;
+  }
+}
+
+function quoteSqlIdentifier(identifier) {
+  return `"${String(identifier || "").replace(/"/g, "\"\"")}"`;
+}
+
+function isPlainObject(value) {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function tableExists(db, tableName) {
+  const row = db
+    .prepare(
+      `
+      SELECT 1
+      FROM sqlite_master
+      WHERE type = 'table' AND name = ?
+      LIMIT 1
+      `
+    )
+    .get(tableName);
+  return Boolean(row);
+}
+
+function getTableColumns(db, tableName) {
+  return db
+    .prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`)
+    .all()
+    .map((column) => column.name);
+}
+
+function createInsertRowHelper(db, tableName, tableColumns) {
+  const statementCache = new Map();
+
+  return (row) => {
+    if (!isPlainObject(row)) {
+      throw new BackupValidationError(`Backup table "${tableName}" contains an invalid row.`);
+    }
+
+    const columns = tableColumns.filter((columnName) =>
+      Object.prototype.hasOwnProperty.call(row, columnName)
+    );
+    if (columns.length === 0) return;
+
+    const cacheKey = columns.join(",");
+    let statement = statementCache.get(cacheKey);
+    if (!statement) {
+      const columnsSql = columns.map((columnName) => quoteSqlIdentifier(columnName)).join(", ");
+      const placeholders = columns.map(() => "?").join(", ");
+      statement = db.prepare(
+        `INSERT INTO ${quoteSqlIdentifier(tableName)} (${columnsSql}) VALUES (${placeholders})`
+      );
+      statementCache.set(cacheKey, statement);
+    }
+
+    statement.run(...columns.map((columnName) => row[columnName]));
+  };
+}
+
+function resolvePathWithinRoot(rootDir, relativePath) {
+  const resolvedRoot = path.resolve(String(rootDir || ""));
+  const normalized = String(relativePath || "").trim();
+  if (!normalized) return null;
+
+  const absolute = path.resolve(resolvedRoot, normalized);
+  const relative = path.relative(resolvedRoot, absolute);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+  return absolute;
+}
+
+function buildBackupFileName(isoDate) {
+  const stamp = String(isoDate || "")
+    .replace(/[-:]/g, "")
+    .replace(/\.\d{3}Z$/, "Z");
+  return `ogis-backup-${stamp || Date.now()}.json`;
+}
+
+function parseBackupPayload(rawBuffer) {
+  let parsed;
+  try {
+    parsed = JSON.parse(rawBuffer.toString("utf8"));
+  } catch (_error) {
+    throw new BackupValidationError("Backup file must contain valid JSON.");
+  }
+
+  if (!isPlainObject(parsed)) {
+    throw new BackupValidationError("Backup payload must be a JSON object.");
+  }
+
+  if (String(parsed.format || "") !== BACKUP_FORMAT) {
+    throw new BackupValidationError(`Unsupported backup format. Expected "${BACKUP_FORMAT}".`);
+  }
+
+  if (Number(parsed.version) !== BACKUP_VERSION) {
+    throw new BackupValidationError(`Unsupported backup version. Expected "${BACKUP_VERSION}".`);
+  }
+
+  return parsed;
+}
+
+function readBackupTableRows(payload, tableName) {
+  const tableRoot = payload?.tables;
+  if (!isPlainObject(tableRoot) || tableRoot[tableName] == null) return [];
+  const rows = tableRoot[tableName];
+  if (!Array.isArray(rows)) {
+    throw new BackupValidationError(`Invalid backup payload: tables.${tableName} must be an array.`);
+  }
+
+  for (const row of rows) {
+    if (!isPlainObject(row)) {
+      throw new BackupValidationError(`Invalid backup payload: tables.${tableName} contains a non-object row.`);
+    }
+  }
+
+  return rows;
+}
+
+function parseBackupMediaEntries(payload) {
+  const media = payload?.files?.media;
+  if (media == null) return [];
+  if (!Array.isArray(media)) {
+    throw new BackupValidationError("Invalid backup payload: files.media must be an array.");
+  }
+
+  const entries = [];
+  for (const rawEntry of media) {
+    if (!isPlainObject(rawEntry)) {
+      throw new BackupValidationError("Invalid backup payload: files.media contains a non-object entry.");
+    }
+
+    const storageRelPath = String(rawEntry.storage_rel_path || "").trim();
+    if (!storageRelPath) {
+      throw new BackupValidationError("Invalid backup payload: media entry is missing storage_rel_path.");
+    }
+    if (!storageRelPath.startsWith("media/")) {
+      throw new BackupValidationError(`Invalid media path "${storageRelPath}".`);
+    }
+
+    const rawBase64 = String(rawEntry.base64 || "");
+    if (!rawBase64) {
+      throw new BackupValidationError(`Media file "${storageRelPath}" is missing base64 data.`);
+    }
+
+    const fileBuffer = Buffer.from(rawBase64, "base64");
+    const checksumSha256 = crypto.createHash("sha256").update(fileBuffer).digest("hex");
+    entries.push({
+      storage_rel_path: storageRelPath,
+      buffer: fileBuffer,
+      checksum_sha256: checksumSha256,
+      size_bytes: fileBuffer.length,
+    });
+  }
+
+  return entries;
+}
+
+function stageBackupMediaFiles(dataDir, mediaEntries) {
+  const stagingRoot = path.resolve(
+    dataDir,
+    `.backup-import-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  );
+  fs.mkdirSync(stagingRoot, { recursive: true });
+
+  try {
+    for (const entry of mediaEntries) {
+      const absolutePath = resolvePathWithinRoot(stagingRoot, entry.storage_rel_path);
+      if (!absolutePath) {
+        throw new BackupValidationError(`Invalid media path "${entry.storage_rel_path}".`);
+      }
+
+      fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+      fs.writeFileSync(absolutePath, entry.buffer);
+    }
+  } catch (error) {
+    fs.rmSync(stagingRoot, { recursive: true, force: true });
+    throw error;
+  }
+
+  return stagingRoot;
+}
+
+function validateRestoreUsers(rows) {
+  const activeAdminCount = rows.filter((row) => {
+    const role = String(row.role || "").toLowerCase();
+    const isActive = Number(row.is_active ?? 1) === 1;
+    return role === "admin" && isActive;
+  }).length;
+
+  if (activeAdminCount < 1) {
+    throw new BackupValidationError("Backup must include at least one active admin user.");
+  }
+}
+
+function applyBackupTables(db, rowsByTable) {
+  const allTableNames = [...new Set([...BACKUP_TABLE_EXPORT_ORDER, ...BACKUP_TABLE_CLEAR_ORDER])];
+  const existingColumnsByTable = new Map();
+
+  for (const tableName of allTableNames) {
+    if (!tableExists(db, tableName)) continue;
+    existingColumnsByTable.set(tableName, getTableColumns(db, tableName));
+  }
+
+  const runImport = db.transaction(() => {
+    for (const tableName of BACKUP_TABLE_CLEAR_ORDER) {
+      if (!existingColumnsByTable.has(tableName)) continue;
+      db.prepare(`DELETE FROM ${quoteSqlIdentifier(tableName)}`).run();
+    }
+
+    for (const tableName of BACKUP_TABLE_EXPORT_ORDER) {
+      const columns = existingColumnsByTable.get(tableName);
+      if (!columns) continue;
+
+      const insertRow = createInsertRowHelper(db, tableName, columns);
+      const rows = rowsByTable[tableName] || [];
+      for (const row of rows) {
+        insertRow(row);
+      }
+    }
+  });
+
+  runImport();
+}
+
+function replaceMediaDirectory(dataDir, stagedRootPath) {
+  const finalMediaDir = path.resolve(dataDir, "media");
+  const stagedMediaDir = path.resolve(stagedRootPath, "media");
+
+  fs.rmSync(finalMediaDir, { recursive: true, force: true });
+  if (fs.existsSync(stagedMediaDir)) {
+    fs.renameSync(stagedMediaDir, finalMediaDir);
+  } else {
+    fs.mkdirSync(finalMediaDir, { recursive: true });
+  }
+}
 
 function normalizeLoginRateLimitKey(username, ipAddress) {
   return `${String(username || "").trim().toLowerCase()}|${String(ipAddress || "").trim() || "unknown"}`;
@@ -206,6 +488,22 @@ function normalizePassword(rawValue) {
   return rawValue;
 }
 
+function normalizeChecklistTemplateKey(rawValue) {
+  if (typeof rawValue !== "string") return "";
+  return rawValue.trim().toLowerCase();
+}
+
+function normalizeChecklistTemplateLabel(rawValue) {
+  if (typeof rawValue !== "string") return "";
+  return rawValue.trim();
+}
+
+function parseChecklistTemplateSortOrder(rawValue) {
+  if (rawValue == null || rawValue === "") return null;
+  const parsed = Number.parseInt(rawValue, 10);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
 function mustChangePasswordForUser(user) {
   return user?.password_changed_at == null;
 }
@@ -247,6 +545,26 @@ function validateFullName(fullName) {
   return { ok: true };
 }
 
+function validateChecklistTemplateKey(itemKey) {
+  if (!CHECKLIST_TEMPLATE_KEY_PATTERN.test(itemKey)) {
+    return {
+      ok: false,
+      message: "item_key must be 2-64 characters using letters, numbers, dot, dash, or underscore",
+    };
+  }
+  return { ok: true };
+}
+
+function validateChecklistTemplateLabel(itemLabel) {
+  if (!itemLabel || itemLabel.length < 2) {
+    return {
+      ok: false,
+      message: "item_label must be at least 2 characters",
+    };
+  }
+  return { ok: true };
+}
+
 function isValidRole(role) {
   return USER_ROLES.has(role);
 }
@@ -270,6 +588,40 @@ function mapDirectoryUser(row) {
     is_active: Number(row.is_active) === 1,
     must_change_password: row.password_changed_at == null,
   };
+}
+
+function mapChecklistTemplateRow(row) {
+  return {
+    id: row.id,
+    item_key: row.item_key,
+    item_label: row.item_label,
+    sort_order: Number.isFinite(row.sort_order) ? row.sort_order : Number(row.sort_order) || 0,
+    created_by: row.created_by ?? null,
+    created_at: row.created_at ?? null,
+    updated_at: row.updated_at ?? null,
+  };
+}
+
+function loadChecklistTemplateRow(db, checklistTemplateId) {
+  const row = db
+    .prepare(
+      `
+      SELECT
+        id,
+        item_key,
+        item_label,
+        sort_order,
+        created_by,
+        created_at,
+        updated_at
+      FROM checklist_templates
+      WHERE id = ?
+      LIMIT 1
+      `
+    )
+    .get(checklistTemplateId);
+
+  return row ? mapChecklistTemplateRow(row) : null;
 }
 
 function loadUserDirectoryRow(db, userId) {
@@ -1013,6 +1365,290 @@ router.get("/directory", requireUser, requirePasswordChangeCompleted, (req, res)
   });
 });
 
+router.get("/checklist-templates", requireUser, requirePasswordChangeCompleted, (req, res) => {
+  const db = req.app.locals.db;
+  if (!tableExists(db, "checklist_templates")) {
+    res.json({ data: [] });
+    return;
+  }
+
+  const rows = db
+    .prepare(
+      `
+      SELECT
+        id,
+        item_key,
+        item_label,
+        sort_order,
+        created_by,
+        created_at,
+        updated_at
+      FROM checklist_templates
+      ORDER BY sort_order ASC, item_label ASC, id ASC
+      `
+    )
+    .all();
+
+  res.json({
+    data: rows.map((row) => mapChecklistTemplateRow(row)),
+  });
+});
+
+router.post("/checklist-templates", requireUser, requirePasswordChangeCompleted, (req, res) => {
+  if (!isAdmin(req.user)) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
+  const itemKey = normalizeChecklistTemplateKey(req.body?.item_key);
+  const itemLabel = normalizeChecklistTemplateLabel(req.body?.item_label);
+  const sortOrderParsed = parseChecklistTemplateSortOrder(req.body?.sort_order);
+
+  const keyValidation = validateChecklistTemplateKey(itemKey);
+  if (!keyValidation.ok) {
+    res.status(400).json({
+      error: "Invalid request",
+      message: keyValidation.message,
+    });
+    return;
+  }
+
+  const labelValidation = validateChecklistTemplateLabel(itemLabel);
+  if (!labelValidation.ok) {
+    res.status(400).json({
+      error: "Invalid request",
+      message: labelValidation.message,
+    });
+    return;
+  }
+
+  if (sortOrderParsed != null && (!Number.isFinite(sortOrderParsed) || sortOrderParsed < 0)) {
+    res.status(400).json({
+      error: "Invalid request",
+      message: "sort_order must be a non-negative integer",
+    });
+    return;
+  }
+
+  const db = req.app.locals.db;
+  const duplicate = db
+    .prepare(
+      `
+      SELECT id
+      FROM checklist_templates
+      WHERE lower(item_key) = lower(?)
+      LIMIT 1
+      `
+    )
+    .get(itemKey);
+
+  if (duplicate) {
+    res.status(409).json({
+      error: "Conflict",
+      message: "A checklist item with that item_key already exists",
+    });
+    return;
+  }
+
+  const created = db.transaction(() => {
+    const sortOrder =
+      sortOrderParsed == null
+        ? Number(
+            db
+              .prepare(
+                `
+                SELECT COALESCE(MAX(sort_order), -10) + 10 AS next_sort_order
+                FROM checklist_templates
+                `
+              )
+              .get()?.next_sort_order
+          ) || 0
+        : sortOrderParsed;
+
+    const result = db
+      .prepare(
+        `
+        INSERT INTO checklist_templates (
+          item_key,
+          item_label,
+          sort_order,
+          created_by
+        )
+        VALUES (?, ?, ?, ?)
+        `
+      )
+      .run(itemKey, itemLabel, sortOrder, req.user.id);
+
+    const checklistTemplateId = Number(result.lastInsertRowid);
+    const row = loadChecklistTemplateRow(db, checklistTemplateId);
+    writeAuditLog(db, req.user.id, "auth.checklist_template_created", "checklist_templates", checklistTemplateId, {
+      after: row,
+    });
+    return row;
+  })();
+
+  res.status(201).json({ data: created });
+});
+
+router.patch("/checklist-templates/:id", requireUser, requirePasswordChangeCompleted, (req, res) => {
+  if (!isAdmin(req.user)) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
+  const checklistTemplateId = Number.parseInt(req.params.id, 10);
+  if (!Number.isFinite(checklistTemplateId)) {
+    res.status(400).json({
+      error: "Invalid request",
+      message: "invalid checklist template id",
+    });
+    return;
+  }
+
+  const hasItemKey = Object.prototype.hasOwnProperty.call(req.body || {}, "item_key");
+  const hasItemLabel = Object.prototype.hasOwnProperty.call(req.body || {}, "item_label");
+  const hasSortOrder = Object.prototype.hasOwnProperty.call(req.body || {}, "sort_order");
+
+  if (!hasItemKey && !hasItemLabel && !hasSortOrder) {
+    res.status(400).json({
+      error: "Invalid request",
+      message: "Provide at least one of: item_key, item_label, sort_order",
+    });
+    return;
+  }
+
+  const db = req.app.locals.db;
+  const existing = loadChecklistTemplateRow(db, checklistTemplateId);
+  if (!existing) {
+    res.status(404).json({ error: "Checklist template not found" });
+    return;
+  }
+
+  const nextItemKey = hasItemKey ? normalizeChecklistTemplateKey(req.body?.item_key) : existing.item_key;
+  const nextItemLabel = hasItemLabel ? normalizeChecklistTemplateLabel(req.body?.item_label) : existing.item_label;
+  const nextSortOrder = hasSortOrder ? parseChecklistTemplateSortOrder(req.body?.sort_order) : existing.sort_order;
+
+  const keyValidation = validateChecklistTemplateKey(nextItemKey);
+  if (!keyValidation.ok) {
+    res.status(400).json({
+      error: "Invalid request",
+      message: keyValidation.message,
+    });
+    return;
+  }
+
+  const labelValidation = validateChecklistTemplateLabel(nextItemLabel);
+  if (!labelValidation.ok) {
+    res.status(400).json({
+      error: "Invalid request",
+      message: labelValidation.message,
+    });
+    return;
+  }
+
+  if (!Number.isFinite(nextSortOrder) || nextSortOrder < 0) {
+    res.status(400).json({
+      error: "Invalid request",
+      message: "sort_order must be a non-negative integer",
+    });
+    return;
+  }
+
+  const duplicate = db
+    .prepare(
+      `
+      SELECT id
+      FROM checklist_templates
+      WHERE lower(item_key) = lower(?) AND id <> ?
+      LIMIT 1
+      `
+    )
+    .get(nextItemKey, checklistTemplateId);
+  if (duplicate) {
+    res.status(409).json({
+      error: "Conflict",
+      message: "A checklist item with that item_key already exists",
+    });
+    return;
+  }
+
+  const changed =
+    nextItemKey !== existing.item_key ||
+    nextItemLabel !== existing.item_label ||
+    nextSortOrder !== existing.sort_order;
+
+  if (changed) {
+    db.prepare(
+      `
+      UPDATE checklist_templates
+      SET
+        item_key = ?,
+        item_label = ?,
+        sort_order = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      `
+    ).run(nextItemKey, nextItemLabel, nextSortOrder, checklistTemplateId);
+
+    writeAuditLog(db, req.user.id, "auth.checklist_template_updated", "checklist_templates", checklistTemplateId, {
+      before: existing,
+      after: {
+        ...existing,
+        item_key: nextItemKey,
+        item_label: nextItemLabel,
+        sort_order: nextSortOrder,
+      },
+    });
+  }
+
+  const updated = loadChecklistTemplateRow(db, checklistTemplateId);
+  res.json({
+    data: {
+      ...updated,
+      changed,
+    },
+  });
+});
+
+router.delete("/checklist-templates/:id", requireUser, requirePasswordChangeCompleted, (req, res) => {
+  if (!isAdmin(req.user)) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
+  const checklistTemplateId = Number.parseInt(req.params.id, 10);
+  if (!Number.isFinite(checklistTemplateId)) {
+    res.status(400).json({
+      error: "Invalid request",
+      message: "invalid checklist template id",
+    });
+    return;
+  }
+
+  const db = req.app.locals.db;
+  const existing = loadChecklistTemplateRow(db, checklistTemplateId);
+  if (!existing) {
+    res.status(404).json({ error: "Checklist template not found" });
+    return;
+  }
+
+  db.prepare(
+    `
+    DELETE FROM checklist_templates
+    WHERE id = ?
+    `
+  ).run(checklistTemplateId);
+
+  writeAuditLog(db, req.user.id, "auth.checklist_template_deleted", "checklist_templates", checklistTemplateId, {
+    before: existing,
+  });
+
+  res.json({
+    success: true,
+    id: checklistTemplateId,
+  });
+});
+
 router.post("/teams", requireUser, requirePasswordChangeCompleted, (req, res) => {
   if (!isAdmin(req.user)) {
     res.status(403).json({ error: "Forbidden" });
@@ -1402,6 +2038,231 @@ router.patch("/users/:id/status", requireUser, requirePasswordChangeCompleted, (
       changed,
       sessions_revoked: sessionsRevoked,
     },
+  });
+});
+
+router.get("/backup/export", requireUser, requirePasswordChangeCompleted, (req, res) => {
+  if (!isAdmin(req.user)) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
+  const db = req.app.locals.db;
+  const dataDir = req.app.locals.config?.dataDir;
+  if (!dataDir) {
+    res.status(500).json({
+      error: "Backup export failed",
+      message: "Server data directory is not configured.",
+    });
+    return;
+  }
+
+  try {
+    const tables = {};
+    for (const tableName of BACKUP_TABLE_EXPORT_ORDER) {
+      if (!tableExists(db, tableName)) {
+        tables[tableName] = [];
+        continue;
+      }
+      tables[tableName] = db.prepare(`SELECT * FROM ${quoteSqlIdentifier(tableName)}`).all();
+    }
+
+    const mediaRows = Array.isArray(tables.media_files) ? tables.media_files : [];
+    const mediaEntries = [];
+    for (const mediaRow of mediaRows) {
+      const storageRelPath = String(mediaRow.storage_rel_path || "").trim();
+      if (!storageRelPath) {
+        throw new BackupValidationError("A media_files row is missing storage_rel_path.", 409);
+      }
+
+      const absolutePath = resolvePathWithinRoot(dataDir, storageRelPath);
+      if (!absolutePath || !fs.existsSync(absolutePath)) {
+        throw new BackupValidationError(`Media file is missing on disk: ${storageRelPath}`, 409);
+      }
+
+      const fileBuffer = fs.readFileSync(absolutePath);
+      mediaEntries.push({
+        storage_rel_path: storageRelPath,
+        base64: fileBuffer.toString("base64"),
+        size_bytes: fileBuffer.length,
+        checksum_sha256: crypto.createHash("sha256").update(fileBuffer).digest("hex"),
+      });
+    }
+
+    const generatedAt = new Date().toISOString();
+    const payload = {
+      format: BACKUP_FORMAT,
+      version: BACKUP_VERSION,
+      generated_at: generatedAt,
+      tables,
+      files: {
+        media: mediaEntries,
+      },
+    };
+
+    const tableCounts = Object.fromEntries(
+      BACKUP_TABLE_EXPORT_ORDER.map((tableName) => [tableName, (tables[tableName] || []).length])
+    );
+    writeAuditLog(db, req.user.id, "auth.backup_exported", "backup", null, {
+      generated_at: generatedAt,
+      table_counts: tableCounts,
+      media_file_count: mediaEntries.length,
+    });
+
+    const backupFileName = buildBackupFileName(generatedAt);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${backupFileName}"`);
+    res.send(JSON.stringify(payload));
+  } catch (error) {
+    const status = error instanceof BackupValidationError ? error.status : 500;
+    const message = error instanceof BackupValidationError ? error.message : "Could not export backup.";
+    res.status(status).json({
+      error: status >= 500 ? "Backup export failed" : "Invalid backup state",
+      message,
+    });
+  }
+});
+
+router.post("/backup/import", requireUser, requirePasswordChangeCompleted, (req, res) => {
+  if (!isAdmin(req.user)) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
+  BACKUP_IMPORT_UPLOAD.single("file")(req, res, (uploadError) => {
+    if (uploadError) {
+      if (uploadError instanceof multer.MulterError && uploadError.code === "LIMIT_FILE_SIZE") {
+        res.status(400).json({
+          error: "Invalid request",
+          message: `Backup file is too large. Maximum size is ${Math.floor(
+            BACKUP_IMPORT_MAX_FILE_SIZE_BYTES / (1024 * 1024)
+          )} MB.`,
+        });
+        return;
+      }
+
+      res.status(400).json({
+        error: "Invalid request",
+        message: uploadError.message || "Could not read the uploaded backup file.",
+      });
+      return;
+    }
+
+    const file = req.file;
+    if (!file?.buffer || file.buffer.length === 0) {
+      res.status(400).json({
+        error: "Invalid request",
+        message: "A backup file is required.",
+      });
+      return;
+    }
+
+    const db = req.app.locals.db;
+    const dataDir = req.app.locals.config?.dataDir;
+    if (!dataDir) {
+      res.status(500).json({
+        error: "Backup import failed",
+        message: "Server data directory is not configured.",
+      });
+      return;
+    }
+
+    let stagedMediaRoot = null;
+    try {
+      const payload = parseBackupPayload(file.buffer);
+      const rowsByTable = {};
+      for (const tableName of BACKUP_TABLE_EXPORT_ORDER) {
+        rowsByTable[tableName] = readBackupTableRows(payload, tableName);
+      }
+
+      validateRestoreUsers(rowsByTable.users || []);
+
+      const mediaEntries = parseBackupMediaEntries(payload);
+      const mediaEntriesByPath = new Map();
+      for (const mediaEntry of mediaEntries) {
+        if (mediaEntriesByPath.has(mediaEntry.storage_rel_path)) {
+          throw new BackupValidationError(`Duplicate media path "${mediaEntry.storage_rel_path}" in backup.`);
+        }
+        mediaEntriesByPath.set(mediaEntry.storage_rel_path, mediaEntry);
+      }
+
+      const mediaRows = rowsByTable.media_files || [];
+      for (const mediaRow of mediaRows) {
+        const storageRelPath = String(mediaRow.storage_rel_path || "").trim();
+        if (!storageRelPath) {
+          throw new BackupValidationError("A media_files row is missing storage_rel_path.");
+        }
+
+        const mediaEntry = mediaEntriesByPath.get(storageRelPath);
+        if (!mediaEntry) {
+          throw new BackupValidationError(`Missing file payload for media path "${storageRelPath}".`);
+        }
+
+        const expectedSize = Number(mediaRow.file_size_bytes);
+        if (Number.isFinite(expectedSize) && expectedSize >= 0 && expectedSize !== mediaEntry.size_bytes) {
+          throw new BackupValidationError(`File size mismatch for media path "${storageRelPath}".`);
+        }
+
+        const expectedChecksum = String(mediaRow.checksum_sha256 || "").trim().toLowerCase();
+        if (expectedChecksum && expectedChecksum !== mediaEntry.checksum_sha256) {
+          throw new BackupValidationError(`Checksum mismatch for media path "${storageRelPath}".`);
+        }
+      }
+
+      if (mediaEntriesByPath.size !== mediaRows.length) {
+        throw new BackupValidationError(
+          "Backup includes media file payloads that are not referenced in media_files."
+        );
+      }
+
+      stagedMediaRoot = stageBackupMediaFiles(dataDir, mediaEntries);
+      applyBackupTables(db, rowsByTable);
+      replaceMediaDirectory(dataDir, stagedMediaRoot);
+
+      fs.rmSync(stagedMediaRoot, { recursive: true, force: true });
+      stagedMediaRoot = null;
+
+      const tableCounts = Object.fromEntries(
+        BACKUP_TABLE_EXPORT_ORDER.map((tableName) => [tableName, (rowsByTable[tableName] || []).length])
+      );
+
+      if (tableExists(db, "audit_logs")) {
+        const actorExists = db
+          .prepare(
+            `
+            SELECT id
+            FROM users
+            WHERE id = ?
+            LIMIT 1
+            `
+          )
+          .get(req.user.id);
+        writeAuditLog(db, actorExists ? req.user.id : null, "auth.backup_imported", "backup", null, {
+          table_counts: tableCounts,
+          media_file_count: mediaEntries.length,
+        });
+      }
+
+      res.json({
+        success: true,
+        requires_relogin: true,
+        restored: {
+          table_counts: tableCounts,
+          media_file_count: mediaEntries.length,
+        },
+      });
+    } catch (error) {
+      if (stagedMediaRoot) {
+        fs.rmSync(stagedMediaRoot, { recursive: true, force: true });
+      }
+
+      const status = error instanceof BackupValidationError ? error.status : 500;
+      const message = error instanceof BackupValidationError ? error.message : "Could not import backup.";
+      res.status(status).json({
+        error: status >= 500 ? "Backup import failed" : "Invalid backup file",
+        message,
+      });
+    }
   });
 });
 
