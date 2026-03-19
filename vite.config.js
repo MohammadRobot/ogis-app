@@ -6,8 +6,21 @@ function parsePort(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseBoolean(value, fallback) {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return fallback;
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
 const host = process.env.VITE_HOST || "0.0.0.0";
 const port = parsePort(process.env.VITE_PORT, 5173);
+const apiProxyTarget = process.env.VITE_API_PROXY_TARGET || "http://127.0.0.1:8787";
+const apiProxySecure = parseBoolean(process.env.VITE_API_PROXY_SECURE, true);
+const apiProxyChangeOrigin = parseBoolean(process.env.VITE_API_PROXY_CHANGE_ORIGIN, true);
 
 // https://vite.dev/config/
 export default defineConfig({
@@ -19,8 +32,9 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8787",
-        changeOrigin: true,
+        target: apiProxyTarget,
+        changeOrigin: apiProxyChangeOrigin,
+        secure: apiProxySecure,
       },
     },
   },

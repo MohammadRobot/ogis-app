@@ -20,6 +20,7 @@ export function loadInspection(req, res, next) {
         overall_result,
         latitude,
         longitude,
+        marker_type,
         geometry_type,
         geometry_json,
         notes,

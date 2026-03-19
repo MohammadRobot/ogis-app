@@ -11,6 +11,86 @@ const userRoleOptions = [
   { value: "supervisor", label: "Supervisor" },
   { value: "admin", label: "Admin" },
 ];
+const DEFAULT_MARKER_TYPE = "standard";
+const MARKER_TYPE_OPTIONS = [
+  { value: "standard", label: "Standard" },
+  { value: "info", label: "Info" },
+  { value: "warning", label: "Warning" },
+  { value: "critical", label: "Critical" },
+];
+const REPORT_STATUS_OPTIONS = [
+  { key: "draft", label: "Draft" },
+  { key: "submitted", label: "Submitted" },
+  { key: "in_review", label: "In Review" },
+  { key: "approved", label: "Approved" },
+  { key: "rejected", label: "Rejected" },
+  { key: "reopened", label: "Reopened" },
+  { key: "closed", label: "Closed" },
+];
+const REPORT_OPEN_STATUSES = new Set(["draft", "submitted", "in_review", "reopened"]);
+const REPORT_CLOSED_STATUSES = new Set(["approved", "rejected", "closed"]);
+const REPORT_REVIEW_QUEUE_STATUSES = new Set(["submitted", "in_review"]);
+const REPORT_STALE_DAYS = 7;
+const TREND_DAY_COUNT = 10;
+const TREND_LABEL_FORMATTER = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+});
+
+function normalizeMarkerType(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (MARKER_TYPE_OPTIONS.some((option) => option.value === normalized)) {
+    return normalized;
+  }
+  return DEFAULT_MARKER_TYPE;
+}
+
+function normalizeStatusValue(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeResultValue(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "pass" || normalized === "fail") {
+    return normalized;
+  }
+  return "na";
+}
+
+function computePercent(value, total, decimals = 0) {
+  const numericValue = Number(value) || 0;
+  const numericTotal = Number(total) || 0;
+  if (!Number.isFinite(numericTotal) || numericTotal <= 0) return 0;
+  const precision = 10 ** Math.max(0, Number(decimals) || 0);
+  return Math.round(((numericValue / numericTotal) * 100) * precision) / precision;
+}
+
+function dayKeyFromDate(value) {
+  if (!(value instanceof Date)) return "";
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function toDateTimestamp(value) {
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function diffDaysFromNow(value) {
+  const timestamp = toDateTimestamp(value);
+  if (!timestamp) return null;
+  const deltaMs = Date.now() - timestamp;
+  if (!Number.isFinite(deltaMs) || deltaMs < 0) return 0;
+  return Math.floor(deltaMs / (24 * 60 * 60 * 1000));
+}
 
 function readStoredToken() {
   if (typeof window === "undefined") return "";
@@ -39,6 +119,7 @@ const mediaBusy = ref(false);
 const timelineBusy = ref(false);
 const reviewBusy = ref(false);
 const notesBusy = ref(false);
+const reportExportBusy = ref(false);
 const directoryBusy = ref(false);
 const teamAdminBusyId = ref(null);
 const teamCreateBusy = ref(false);
@@ -203,6 +284,12 @@ const locationDraft = reactive({
   latitude: "",
   longitude: "",
 });
+const inspectionDetailsDraft = reactive({
+  site_name: "",
+  team_id: "",
+  assigned_to: "",
+  marker_type: DEFAULT_MARKER_TYPE,
+});
 
 const reviewData = ref([]);
 const reviewForm = reactive({
@@ -214,6 +301,7 @@ const newInspectionForm = reactive({
   site_name: "",
   team_id: "",
   assigned_to: "",
+  marker_type: DEFAULT_MARKER_TYPE,
   latitude: "",
   longitude: "",
   notes: "",
@@ -280,8 +368,22 @@ const createAssignableUsers = computed(() => {
   if (!Number.isFinite(teamId)) return [];
   return userDirectory.value.filter((user) => Number(user.team_id) === teamId && user.is_active !== false);
 });
+const detailAssignableUsers = computed(() => {
+  const teamId = Number.parseInt(String(inspectionDetailsDraft.team_id || "").trim(), 10);
+  if (!Number.isFinite(teamId)) return [];
+  return userDirectory.value.filter((user) => Number(user.team_id) === teamId && user.is_active !== false);
+});
 const teamLabelMap = computed(
   () => new Map(teamDirectory.value.map((team) => [Number(team.id), String(team.label || `Field Team ${team.id}`)]))
+);
+const userLabelMap = computed(
+  () =>
+    new Map(
+      userDirectory.value.map((user) => [
+        Number(user.id),
+        String(user.full_name || user.username || `User ${user.id}`),
+      ])
+    )
 );
 const currentUserTeamLabels = computed(() => {
   const labels = (currentUser.value?.team_ids || [])
@@ -324,11 +426,297 @@ const activeFilterSummary = computed(() => {
 
   return tokens;
 });
+const reportStatusDistribution = computed(() => {
+  const counts = new Map(REPORT_STATUS_OPTIONS.map((status) => [status.key, 0]));
+  for (const inspection of mapInspections.value) {
+    const status = normalizeStatusValue(inspection?.status);
+    if (counts.has(status)) {
+      counts.set(status, (counts.get(status) || 0) + 1);
+    }
+  }
+
+  const total = mapInspections.value.length;
+  return REPORT_STATUS_OPTIONS.map((status) => {
+    const value = counts.get(status.key) || 0;
+    return {
+      ...status,
+      value,
+      percent: computePercent(value, total),
+    };
+  });
+});
+const reportResultDistribution = computed(() => {
+  const counts = {
+    pass: 0,
+    fail: 0,
+    na: 0,
+  };
+
+  for (const inspection of mapInspections.value) {
+    const result = normalizeResultValue(inspection?.overall_result);
+    counts[result] += 1;
+  }
+
+  const total = mapInspections.value.length;
+  return [
+    { key: "pass", label: "Pass", value: counts.pass, percent: computePercent(counts.pass, total) },
+    { key: "fail", label: "Fail", value: counts.fail, percent: computePercent(counts.fail, total) },
+    { key: "na", label: "N/A", value: counts.na, percent: computePercent(counts.na, total) },
+  ];
+});
+const reportMetrics = computed(() => {
+  const total = mapInspections.value.length;
+  let open = 0;
+  let closed = 0;
+  let pass = 0;
+  let fail = 0;
+  let withMedia = 0;
+  let totalMedia = 0;
+  let pointGeometry = 0;
+  let areaGeometry = 0;
+
+  for (const inspection of mapInspections.value) {
+    const status = normalizeStatusValue(inspection?.status);
+    if (REPORT_OPEN_STATUSES.has(status)) open += 1;
+    if (REPORT_CLOSED_STATUSES.has(status)) closed += 1;
+
+    const result = normalizeResultValue(inspection?.overall_result);
+    if (result === "pass") pass += 1;
+    if (result === "fail") fail += 1;
+
+    const mediaCount = Number(inspection?.media_count) || 0;
+    totalMedia += mediaCount;
+    if (mediaCount > 0) withMedia += 1;
+
+    const geometryType = String(inspection?.geometry_type || "").toLowerCase();
+    if (geometryType === "point") pointGeometry += 1;
+    if (geometryType === "area") areaGeometry += 1;
+  }
+
+  const mappedFallback = mapInspections.value.filter(
+    (inspection) =>
+      Number.isFinite(Number(inspection?.latitude)) &&
+      Number.isFinite(Number(inspection?.longitude))
+  ).length;
+  const mappedCount = Number.isFinite(Number(mapMeta.value?.with_location))
+    ? Number(mapMeta.value.with_location)
+    : mappedFallback;
+
+  return {
+    total,
+    open,
+    closed,
+    pass,
+    fail,
+    na: Math.max(total - pass - fail, 0),
+    mapped: mappedCount,
+    withMedia,
+    totalMedia,
+    pointGeometry,
+    areaGeometry,
+    passRate: computePercent(pass, total),
+    failRate: computePercent(fail, total),
+    mappedRate: computePercent(mappedCount, total),
+    mediaCoverage: computePercent(withMedia, total),
+    avgMedia: total > 0 ? (totalMedia / total).toFixed(1) : "0.0",
+  };
+});
+const reportDetailInsights = computed(() => {
+  let withPhotos = 0;
+  let withDocuments = 0;
+  let reviewQueue = 0;
+  let staleOpen = 0;
+  let criticalMarkers = 0;
+  let withoutLocation = 0;
+
+  for (const inspection of mapInspections.value) {
+    const photoCount = Number(inspection?.media_photo_count) || 0;
+    const documentCount = Number(inspection?.media_document_count) || 0;
+    if (photoCount > 0) withPhotos += 1;
+    if (documentCount > 0) withDocuments += 1;
+
+    const status = normalizeStatusValue(inspection?.status);
+    if (REPORT_REVIEW_QUEUE_STATUSES.has(status)) reviewQueue += 1;
+    if (REPORT_OPEN_STATUSES.has(status)) {
+      const days = diffDaysFromNow(inspection?.updated_at);
+      if (days != null && days >= REPORT_STALE_DAYS) staleOpen += 1;
+    }
+
+    if (normalizeMarkerType(inspection?.marker_type) === "critical") criticalMarkers += 1;
+
+    const hasLocation =
+      Number.isFinite(Number(inspection?.latitude)) &&
+      Number.isFinite(Number(inspection?.longitude));
+    if (!hasLocation) withoutLocation += 1;
+  }
+
+  return {
+    withPhotos,
+    withDocuments,
+    reviewQueue,
+    staleOpen,
+    criticalMarkers,
+    withoutLocation,
+  };
+});
+const reportTrendSeries = computed(() => {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const rows = [];
+  for (let offset = TREND_DAY_COUNT - 1; offset >= 0; offset -= 1) {
+    const day = new Date(today);
+    day.setDate(today.getDate() - offset);
+    rows.push({
+      key: dayKeyFromDate(day),
+      label: TREND_LABEL_FORMATTER.format(day),
+      total: 0,
+      pass: 0,
+      fail: 0,
+      na: 0,
+    });
+  }
+
+  const rowMap = new Map(rows.map((entry) => [entry.key, entry]));
+  for (const inspection of mapInspections.value) {
+    const timestamp = toDateTimestamp(inspection?.updated_at);
+    if (!timestamp) continue;
+
+    const updatedDate = new Date(timestamp);
+    updatedDate.setHours(0, 0, 0, 0);
+    const row = rowMap.get(dayKeyFromDate(updatedDate));
+    if (!row) continue;
+
+    row.total += 1;
+    const result = normalizeResultValue(inspection?.overall_result);
+    row[result] += 1;
+  }
+
+  const maxTotal = Math.max(1, ...rows.map((entry) => entry.total));
+  return rows.map((entry) => ({
+    ...entry,
+    percent: computePercent(entry.total, maxTotal),
+  }));
+});
+const reportTeamBreakdown = computed(() => {
+  const rows = new Map();
+
+  for (const inspection of mapInspections.value) {
+    const teamId = Number(inspection?.team_id);
+    const key = Number.isFinite(teamId) ? String(teamId) : "unassigned";
+
+    if (!rows.has(key)) {
+      rows.set(key, {
+        key,
+        team_id: Number.isFinite(teamId) ? teamId : null,
+        label: Number.isFinite(teamId) ? teamLabelMap.value.get(teamId) || `Field Team ${teamId}` : "Unassigned",
+        total: 0,
+        open: 0,
+        pass: 0,
+        fail: 0,
+        withMedia: 0,
+      });
+    }
+
+    const row = rows.get(key);
+    row.total += 1;
+
+    const status = normalizeStatusValue(inspection?.status);
+    if (REPORT_OPEN_STATUSES.has(status)) {
+      row.open += 1;
+    }
+
+    const result = normalizeResultValue(inspection?.overall_result);
+    if (result === "pass") row.pass += 1;
+    if (result === "fail") row.fail += 1;
+
+    const mediaCount = Number(inspection?.media_count) || 0;
+    if (mediaCount > 0) {
+      row.withMedia += 1;
+    }
+  }
+
+  return Array.from(rows.values())
+    .map((row) => ({
+      ...row,
+      passRate: computePercent(row.pass, row.total),
+      failRate: computePercent(row.fail, row.total),
+      mediaCoverage: computePercent(row.withMedia, row.total),
+    }))
+    .sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
+});
+const reportInspectionRows = computed(() =>
+  [...mapInspections.value].sort((a, b) => {
+    const updatedDelta = toDateTimestamp(b?.updated_at) - toDateTimestamp(a?.updated_at);
+    if (updatedDelta !== 0) return updatedDelta;
+    return Number(b?.id || 0) - Number(a?.id || 0);
+  })
+);
+const reportExportRows = computed(() =>
+  reportInspectionRows.value.map((inspection) => ({
+    id: Number(inspection?.id) || null,
+    inspection_no: String(inspection?.inspection_no || ""),
+    site_name: String(inspection?.site_name || ""),
+    team: teamLabel(inspection?.team_id),
+    assigned_to: userLabel(inspection?.assigned_to),
+    created_by: userLabel(inspection?.created_by),
+    status: String(inspection?.status || ""),
+    overall_result: String(inspection?.overall_result || "na"),
+    marker_type: markerTypeLabel(inspection?.marker_type),
+    geometry_type: geometryTypeLabel(inspection?.geometry_type),
+    media_count: Number(inspection?.media_count) || 0,
+    media_photo_count: Number(inspection?.media_photo_count) || 0,
+    media_document_count: Number(inspection?.media_document_count) || 0,
+    media_cover_file_name: String(inspection?.media_cover_file_name || ""),
+    latitude: Number.isFinite(Number(inspection?.latitude)) ? Number(inspection?.latitude) : "",
+    longitude: Number.isFinite(Number(inspection?.longitude)) ? Number(inspection?.longitude) : "",
+    location_label: coordinateLabel(inspection?.latitude, inspection?.longitude),
+    created_at: String(inspection?.created_at || ""),
+    updated_at: String(inspection?.updated_at || ""),
+    updated_age_days: diffDaysFromNow(inspection?.updated_at) ?? "",
+    updated_age_label: updatedAgeLabel(inspection?.updated_at),
+    notes: String(inspection?.notes || ""),
+  }))
+);
 
 function teamLabel(teamId) {
   const parsed = Number(teamId);
   if (!Number.isFinite(parsed)) return "-";
   return teamLabelMap.value.get(parsed) || `Field Team ${parsed}`;
+}
+
+function userLabel(userId) {
+  const parsed = Number(userId);
+  if (!Number.isFinite(parsed)) return "-";
+  return userLabelMap.value.get(parsed) || `User ${parsed}`;
+}
+
+function markerTypeLabel(markerType) {
+  const normalized = normalizeMarkerType(markerType);
+  const option = MARKER_TYPE_OPTIONS.find((item) => item.value === normalized);
+  return option?.label || "Standard";
+}
+
+function geometryTypeLabel(geometryType) {
+  const normalized = String(geometryType || "").toLowerCase();
+  if (normalized === "point") return "Point";
+  if (normalized === "area") return "Area";
+  return "Unknown";
+}
+
+function coordinateLabel(latitude, longitude) {
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return "No location";
+  return `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+}
+
+function updatedAgeLabel(value) {
+  const days = diffDaysFromNow(value);
+  if (days == null) return "-";
+  if (days === 0) return "Today";
+  if (days === 1) return "1 day";
+  return `${days} days`;
 }
 
 function syncTeamNameDrafts() {
@@ -591,6 +979,10 @@ function resetWorkspace() {
   notesDraft.value = "";
   locationDraft.latitude = "";
   locationDraft.longitude = "";
+  inspectionDetailsDraft.site_name = "";
+  inspectionDetailsDraft.team_id = "";
+  inspectionDetailsDraft.assigned_to = "";
+  inspectionDetailsDraft.marker_type = DEFAULT_MARKER_TYPE;
   activeTab.value = "overview";
   leftPanelExpanded.value = false;
   rightPanelExpanded.value = false;
@@ -605,6 +997,7 @@ function resetWorkspace() {
   userRoleBusyId.value = null;
   userStatusBusyId.value = null;
   userPasswordBusyId.value = null;
+  reportExportBusy.value = false;
   inspectionDeleteBusy.value = false;
   backupExportBusy.value = false;
   backupImportBusy.value = false;
@@ -623,6 +1016,7 @@ function resetWorkspace() {
   newUserForm.role = "inspector";
   newUserForm.team_id = "";
   newUserForm.password = "";
+  newInspectionForm.marker_type = DEFAULT_MARKER_TYPE;
   newChecklistTemplateForm.item_key = "";
   newChecklistTemplateForm.item_label = "";
   newChecklistTemplateForm.sort_order = "";
@@ -752,6 +1146,27 @@ function syncCreateAssigneeForTeam(preferCurrentUser = true) {
     ? availableUsers.find((user) => user.id === currentUser.value?.id)
     : null;
   newInspectionForm.assigned_to = String(currentUserOption?.id ?? availableUsers[0].id);
+}
+
+function syncInspectionAssigneeForTeam(preferCurrentUser = false) {
+  const availableUsers = detailAssignableUsers.value;
+  if (availableUsers.length === 0) {
+    inspectionDetailsDraft.assigned_to = "";
+    return;
+  }
+
+  const currentAssigned = Number.parseInt(String(inspectionDetailsDraft.assigned_to || "").trim(), 10);
+  if (availableUsers.some((user) => user.id === currentAssigned)) {
+    return;
+  }
+
+  const currentInspectionAssignee = availableUsers.find((user) => user.id === selectedInspection.value?.assigned_to);
+  const currentUserOption = preferCurrentUser
+    ? availableUsers.find((user) => user.id === currentUser.value?.id)
+    : null;
+  inspectionDetailsDraft.assigned_to = String(
+    currentInspectionAssignee?.id ?? currentUserOption?.id ?? availableUsers[0].id
+  );
 }
 
 function seedCreateFormDirectoryDefaults() {
@@ -1289,6 +1704,410 @@ async function exportBackup() {
   }
 }
 
+function escapeCsvCell(value) {
+  const text = value == null ? "" : String(value);
+  if (/["\n\r,]/.test(text)) {
+    return `"${text.replace(/"/g, "\"\"")}"`;
+  }
+  return text;
+}
+
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function reportExportFileStem() {
+  const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  return `inspection-report-${timestamp}`;
+}
+
+function downloadTextFile(content, fileName, mimeType = "text/plain;charset=utf-8") {
+  if (typeof window === "undefined") return;
+  const blob = new Blob([content], { type: mimeType });
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
+}
+
+async function exportReportCsv() {
+  clearMessages();
+  if (reportExportRows.value.length === 0) {
+    setError("No report records to export.");
+    return;
+  }
+
+  reportExportBusy.value = true;
+  try {
+    const columns = [
+      { key: "id", label: "ID" },
+      { key: "inspection_no", label: "Inspection No" },
+      { key: "site_name", label: "Site Name" },
+      { key: "team", label: "Team" },
+      { key: "assigned_to", label: "Assigned To" },
+      { key: "created_by", label: "Created By" },
+      { key: "status", label: "Status" },
+      { key: "overall_result", label: "Overall Result" },
+      { key: "marker_type", label: "Marker Type" },
+      { key: "geometry_type", label: "Geometry Type" },
+      { key: "media_count", label: "Media Count" },
+      { key: "media_photo_count", label: "Media Photo Count" },
+      { key: "media_document_count", label: "Media Document Count" },
+      { key: "media_cover_file_name", label: "Media Cover File" },
+      { key: "location_label", label: "Location" },
+      { key: "latitude", label: "Latitude" },
+      { key: "longitude", label: "Longitude" },
+      { key: "created_at", label: "Created At" },
+      { key: "updated_at", label: "Updated At" },
+      { key: "updated_age_days", label: "Updated Age (days)" },
+      { key: "notes", label: "Notes" },
+    ];
+
+    const lines = [
+      columns.map((column) => escapeCsvCell(column.label)).join(","),
+      ...reportExportRows.value.map((row) =>
+        columns.map((column) => escapeCsvCell(row[column.key])).join(",")
+      ),
+    ];
+
+    const fileName = `${reportExportFileStem()}.csv`;
+    downloadTextFile(lines.join("\r\n"), fileName, "text/csv;charset=utf-8");
+    setNotice(`Report exported: ${fileName}.`);
+  } catch (error) {
+    setError(formatApiError(error, "Could not export report CSV"));
+  } finally {
+    reportExportBusy.value = false;
+  }
+}
+
+async function exportReportJson() {
+  clearMessages();
+  if (reportExportRows.value.length === 0) {
+    setError("No report records to export.");
+    return;
+  }
+
+  reportExportBusy.value = true;
+  try {
+    const payload = {
+      generated_at: new Date().toISOString(),
+      filters: {
+        search: String(listFilters.search || "").trim(),
+        status: String(listFilters.status || "").trim(),
+        team_id: String(listFilters.team_id || "").trim(),
+        sort: String(listFilters.sort || "").trim(),
+      },
+      metrics: reportMetrics.value,
+      status_distribution: reportStatusDistribution.value,
+      result_distribution: reportResultDistribution.value,
+      trend_last_days: reportTrendSeries.value,
+      teams: reportTeamBreakdown.value,
+      inspections: reportExportRows.value,
+    };
+
+    const fileName = `${reportExportFileStem()}.json`;
+    downloadTextFile(`${JSON.stringify(payload, null, 2)}\n`, fileName, "application/json;charset=utf-8");
+    setNotice(`Report exported: ${fileName}.`);
+  } catch (error) {
+    setError(formatApiError(error, "Could not export report JSON"));
+  } finally {
+    reportExportBusy.value = false;
+  }
+}
+
+async function exportReportPdf() {
+  clearMessages();
+  if (reportExportRows.value.length === 0) {
+    setError("No report records to export.");
+    return;
+  }
+
+  reportExportBusy.value = true;
+  try {
+    if (typeof window === "undefined") return;
+    const rowsPerPage = 35;
+    const chunks = [];
+    for (let start = 0; start < reportExportRows.value.length; start += rowsPerPage) {
+      chunks.push(reportExportRows.value.slice(start, start + rowsPerPage));
+    }
+
+    const buildTableRows = (rows) =>
+      rows
+        .map(
+          (row) => `
+            <tr>
+              <td>${escapeHtml(row.inspection_no)}</td>
+              <td>${escapeHtml(row.site_name)}</td>
+              <td>${escapeHtml(row.team)}</td>
+              <td>${escapeHtml(row.assigned_to)}</td>
+              <td>${escapeHtml(row.status)}</td>
+              <td>${escapeHtml(row.overall_result)}</td>
+              <td>${escapeHtml(row.marker_type)}</td>
+              <td>${escapeHtml(row.geometry_type)}</td>
+              <td>${escapeHtml(row.location_label)}</td>
+              <td>${escapeHtml(`${row.media_count} (${row.media_photo_count}/${row.media_document_count})`)}</td>
+              <td>${escapeHtml(formatDate(row.created_at))}</td>
+              <td>${escapeHtml(formatDate(row.updated_at))}</td>
+              <td>${escapeHtml(row.updated_age_label)}</td>
+            </tr>
+          `
+        )
+        .join("");
+
+    const statusRows = reportStatusDistribution.value
+      .map(
+        (row) => `
+          <tr>
+            <td>${escapeHtml(row.label)}</td>
+            <td>${escapeHtml(row.value)}</td>
+            <td>${escapeHtml(`${row.percent}%`)}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const resultRows = reportResultDistribution.value
+      .map(
+        (row) => `
+          <tr>
+            <td>${escapeHtml(row.label)}</td>
+            <td>${escapeHtml(row.value)}</td>
+            <td>${escapeHtml(`${row.percent}%`)}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const teamRows = reportTeamBreakdown.value
+      .map(
+        (row) => `
+          <tr>
+            <td>${escapeHtml(row.label)}</td>
+            <td>${escapeHtml(row.total)}</td>
+            <td>${escapeHtml(row.open)}</td>
+            <td>${escapeHtml(`${row.pass} (${row.passRate}%)`)}</td>
+            <td>${escapeHtml(`${row.fail} (${row.failRate}%)`)}</td>
+            <td>${escapeHtml(`${row.withMedia} (${row.mediaCoverage}%)`)}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const trendRows = reportTrendSeries.value
+      .map(
+        (row) => `
+          <tr>
+            <td>${escapeHtml(row.label)}</td>
+            <td>${escapeHtml(row.total)}</td>
+            <td>${escapeHtml(row.pass)}</td>
+            <td>${escapeHtml(row.fail)}</td>
+            <td>${escapeHtml(row.na)}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const tableSections = chunks
+      .map((chunk, index) => {
+        const startRow = index * rowsPerPage + 1;
+        const endRow = startRow + chunk.length - 1;
+        return `
+          <section class="report-section ${index < chunks.length - 1 ? "page-break" : ""}">
+            <h2>Inspection records ${startRow}-${endRow}</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>Inspection</th>
+                  <th>Site</th>
+                  <th>Team</th>
+                  <th>Assignee</th>
+                  <th>Status</th>
+                  <th>Result</th>
+                  <th>Marker</th>
+                  <th>Geometry</th>
+                  <th>Location</th>
+                  <th>Media</th>
+                  <th>Created</th>
+                  <th>Updated</th>
+                  <th>Age</th>
+                </tr>
+              </thead>
+              <tbody>${buildTableRows(chunk)}</tbody>
+            </table>
+          </section>
+        `;
+      })
+      .join("");
+    const filterSummary = activeFilterSummary.value.length > 0 ? activeFilterSummary.value.join(" | ") : "No filters";
+    const generatedAt = formatDate(new Date().toISOString());
+    const reportTitle = `Inspection Report (${reportMetrics.value.total} records)`;
+
+    const html = `
+      <!doctype html>
+      <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>${escapeHtml(reportTitle)}</title>
+        <style>
+          :root { color-scheme: light; }
+          @page { size: A4 landscape; margin: 10mm; }
+          body { font-family: "Segoe UI", Arial, sans-serif; color: #0f2434; margin: 22px; }
+          h1 { margin: 0 0 8px; font-size: 20px; }
+          h2 { margin: 0 0 8px; font-size: 13px; color: #2c4c60; }
+          p { margin: 0 0 4px; color: #3b5263; font-size: 12px; }
+          .toolbar { margin: 12px 0; }
+          .toolbar button {
+            border: 1px solid #8ea4b6;
+            background: #eff6fb;
+            color: #16354c;
+            border-radius: 6px;
+            font-size: 12px;
+            padding: 6px 10px;
+            cursor: pointer;
+          }
+          .summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin: 14px 0 16px; }
+          .metric { border: 1px solid #b9c8d4; border-radius: 8px; padding: 8px; background: #f7fafc; }
+          .metric strong { display: block; margin-top: 4px; font-size: 15px; color: #102739; }
+          .section-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 10px; }
+          .section-card { border: 1px solid #d0dce6; border-radius: 8px; background: #fbfdff; padding: 8px; }
+          .section-card h3 { margin: 0 0 8px; font-size: 13px; color: #17354a; }
+          .list-kv { margin: 0; padding-left: 18px; }
+          .list-kv li { margin: 4px 0; font-size: 12px; color: #29485d; }
+          table { width: 100%; border-collapse: collapse; margin-top: 8px; table-layout: fixed; }
+          th, td { border-bottom: 1px solid #d6e0e7; padding: 6px; text-align: left; font-size: 12px; }
+          td { word-break: break-word; }
+          th { background: #edf4f9; text-transform: uppercase; letter-spacing: 0.03em; font-size: 11px; }
+          thead { display: table-header-group; }
+          .report-section { margin-bottom: 10px; }
+          .page-break { page-break-after: always; break-after: page; }
+          @media print {
+            body { margin: 10mm; }
+            .toolbar { display: none; }
+            .metric { break-inside: avoid; }
+            tr { page-break-inside: avoid; break-inside: avoid; }
+            .section-card { break-inside: avoid; }
+          }
+        </style>
+      </head>
+      <body>
+        <h1>${escapeHtml(reportTitle)}</h1>
+        <p>Generated: ${escapeHtml(generatedAt)}</p>
+        <p>Filters: ${escapeHtml(filterSummary)}</p>
+        <div class="toolbar">
+          <button type="button" onclick="window.print()">Print / Save PDF</button>
+        </div>
+        <div class="summary">
+          <div class="metric">Total inspections<strong>${escapeHtml(reportMetrics.value.total)}</strong></div>
+          <div class="metric">Pass rate<strong>${escapeHtml(reportMetrics.value.passRate)}%</strong></div>
+          <div class="metric">Fail rate<strong>${escapeHtml(reportMetrics.value.failRate)}%</strong></div>
+          <div class="metric">Media coverage<strong>${escapeHtml(reportMetrics.value.mediaCoverage)}%</strong></div>
+          <div class="metric">Stale open (>=${REPORT_STALE_DAYS}d)<strong>${escapeHtml(reportDetailInsights.value.staleOpen)}</strong></div>
+        </div>
+        <div class="section-grid">
+          <section class="section-card">
+            <h3>Status distribution</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>Status</th>
+                  <th>Count</th>
+                  <th>Percent</th>
+                </tr>
+              </thead>
+              <tbody>${statusRows}</tbody>
+            </table>
+          </section>
+          <section class="section-card">
+            <h3>Result distribution</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>Result</th>
+                  <th>Count</th>
+                  <th>Percent</th>
+                </tr>
+              </thead>
+              <tbody>${resultRows}</tbody>
+            </table>
+          </section>
+        </div>
+        <div class="section-grid">
+          <section class="section-card">
+            <h3>Operational details</h3>
+            <ul class="list-kv">
+              <li>Review queue: <strong>${escapeHtml(reportDetailInsights.value.reviewQueue)}</strong></li>
+              <li>Stale open (>=${REPORT_STALE_DAYS}d): <strong>${escapeHtml(reportDetailInsights.value.staleOpen)}</strong></li>
+              <li>Critical markers: <strong>${escapeHtml(reportDetailInsights.value.criticalMarkers)}</strong></li>
+              <li>With photos: <strong>${escapeHtml(reportDetailInsights.value.withPhotos)}</strong></li>
+              <li>With documents: <strong>${escapeHtml(reportDetailInsights.value.withDocuments)}</strong></li>
+              <li>Without map location: <strong>${escapeHtml(reportDetailInsights.value.withoutLocation)}</strong></li>
+            </ul>
+          </section>
+          <section class="section-card">
+            <h3>Update trend (${escapeHtml(reportTrendSeries.value.length)} days)</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>Day</th>
+                  <th>Total</th>
+                  <th>Pass</th>
+                  <th>Fail</th>
+                  <th>N/A</th>
+                </tr>
+              </thead>
+              <tbody>${trendRows}</tbody>
+            </table>
+          </section>
+        </div>
+        <section class="report-section page-break">
+          <h2>Team summary</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Team</th>
+                <th>Total</th>
+                <th>Open</th>
+                <th>Pass</th>
+                <th>Fail</th>
+                <th>Media</th>
+              </tr>
+            </thead>
+            <tbody>${teamRows}</tbody>
+          </table>
+        </section>
+        ${tableSections}
+      </body>
+      </html>
+    `;
+
+    const printWindow = window.open("", "_blank", "width=1400,height=950");
+    if (!printWindow) {
+      setError("Popup blocked. Allow popups to export PDF.");
+      return;
+    }
+
+    printWindow.document.open();
+    printWindow.document.write(html);
+    printWindow.document.close();
+    printWindow.focus();
+
+    setNotice(`PDF preview opened with ${reportExportRows.value.length} report record(s). Use Print / Save PDF.`);
+  } catch (error) {
+    setError(formatApiError(error, "Could not export report PDF"));
+  } finally {
+    reportExportBusy.value = false;
+  }
+}
+
 function onBackupFileChange(event) {
   backupImportFile.value = event?.target?.files?.[0] || null;
 }
@@ -1520,6 +2339,7 @@ async function createInspection() {
         site_name: newInspectionForm.site_name.trim(),
         team_id: teamId,
         assigned_to: assignedTo,
+        marker_type: normalizeMarkerType(newInspectionForm.marker_type),
         geometry: createGeometryDraft.value,
         notes: newInspectionForm.notes.trim() || undefined,
       },
@@ -1528,6 +2348,7 @@ async function createInspection() {
     newInspectionForm.site_name = "";
     newInspectionForm.team_id = "";
     newInspectionForm.assigned_to = "";
+    newInspectionForm.marker_type = DEFAULT_MARKER_TYPE;
     newInspectionForm.latitude = "";
     newInspectionForm.longitude = "";
     newInspectionForm.notes = "";
@@ -1591,11 +2412,18 @@ async function refreshDashboard() {
 async function loadInspectionCore(inspectionId) {
   const response = await apiRequest(`/inspections/${inspectionId}`);
   selectedInspection.value = response?.data || null;
+  inspectionDetailsDraft.site_name = selectedInspection.value?.site_name || "";
+  inspectionDetailsDraft.team_id =
+    selectedInspection.value?.team_id == null ? "" : String(selectedInspection.value.team_id);
+  inspectionDetailsDraft.assigned_to =
+    selectedInspection.value?.assigned_to == null ? "" : String(selectedInspection.value.assigned_to);
+  inspectionDetailsDraft.marker_type = normalizeMarkerType(selectedInspection.value?.marker_type);
   notesDraft.value = selectedInspection.value?.notes || "";
   locationDraft.latitude =
     selectedInspection.value?.latitude == null ? "" : String(selectedInspection.value.latitude);
   locationDraft.longitude =
     selectedInspection.value?.longitude == null ? "" : String(selectedInspection.value.longitude);
+  syncInspectionAssigneeForTeam(false);
 }
 
 async function loadChecklist(inspectionId) {
@@ -1742,7 +2570,7 @@ async function deleteInspectionAsAdmin() {
   }
 }
 
-async function saveInspectionNotes() {
+async function saveInspectionDetails() {
   if (!selectedInspectionId.value) return;
   clearMessages();
 
@@ -1759,13 +2587,39 @@ async function saveInspectionNotes() {
 
   notesBusy.value = true;
   try {
+    const body = {
+      notes: notesDraft.value,
+      latitude: parsedLatitude,
+      longitude: parsedLongitude,
+      marker_type: normalizeMarkerType(inspectionDetailsDraft.marker_type),
+    };
+
+    if (hasSupervisorPrivileges.value) {
+      const siteName = String(inspectionDetailsDraft.site_name || "").trim();
+      const teamId = parseInteger(inspectionDetailsDraft.team_id);
+      const assignedTo = parseInteger(inspectionDetailsDraft.assigned_to);
+
+      if (!siteName) {
+        setError("Site name is required.");
+        return;
+      }
+      if (!Number.isFinite(teamId)) {
+        setError("Select a valid team.");
+        return;
+      }
+      if (!Number.isFinite(assignedTo)) {
+        setError("Select a valid assignee.");
+        return;
+      }
+
+      body.site_name = siteName;
+      body.team_id = teamId;
+      body.assigned_to = assignedTo;
+    }
+
     await apiRequest(`/inspections/${selectedInspectionId.value}`, {
       method: "PATCH",
-      body: {
-        notes: notesDraft.value,
-        latitude: parsedLatitude,
-        longitude: parsedLongitude,
-      },
+      body,
     });
     await Promise.all([
       loadInspectionCore(selectedInspectionId.value),
@@ -1783,6 +2637,7 @@ async function saveInspectionNotes() {
 async function saveInspectionGeometry(payload) {
   const inspectionId = Number(payload?.inspection_id);
   const geometry = payload?.geometry;
+  const markerType = normalizeMarkerType(payload?.marker_type || selectedInspection.value?.marker_type);
   if (!Number.isFinite(inspectionId) || !geometry) {
     setError("Invalid geometry payload.");
     return;
@@ -1793,7 +2648,7 @@ async function saveInspectionGeometry(payload) {
   try {
     await apiRequest(`/inspections/${inspectionId}`, {
       method: "PATCH",
-      body: { geometry },
+      body: { geometry, marker_type: markerType },
     });
 
     if (selectedInspectionId.value === inspectionId) {
@@ -1813,9 +2668,13 @@ async function createMasterOverlay(payload) {
   clearMessages();
   mapBusy.value = true;
   try {
+    const markerType = normalizeMarkerType(payload?.marker_type);
     await apiRequest("/inspections/master-map/overlays", {
       method: "POST",
-      body: payload,
+      body: {
+        ...payload,
+        marker_type: markerType,
+      },
     });
     await loadInspectionMapData();
     setNotice("Master map overlay created.");
@@ -2341,6 +3200,14 @@ watch(
     syncCreateAssigneeForTeam(false);
   }
 );
+
+watch(
+  () => inspectionDetailsDraft.team_id,
+  () => {
+    if (!selectedInspectionId.value) return;
+    syncInspectionAssigneeForTeam(true);
+  }
+);
 </script>
 
 <template>
@@ -2524,6 +3391,13 @@ watch(
               Filter
             </button>
             <button
+              type="button"
+              :class="['rail-tab', { active: leftRailTab === 'reports' }]"
+              @click="setLeftRailTab('reports')"
+            >
+              Reports
+            </button>
+            <button
               v-if="isAdminUser"
               type="button"
               :class="['rail-tab', { active: leftRailTab === 'admin' }]"
@@ -2635,6 +3509,14 @@ watch(
               <input :value="createGeometryTypeLabel" readonly placeholder="Pick from map" />
             </label>
             <label>
+              Marker type
+              <select v-model="newInspectionForm.marker_type">
+                <option v-for="option in MARKER_TYPE_OPTIONS" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
+            <label>
               Area vertices
               <input :value="createAreaVertexCount || '-'" readonly placeholder="Draw area on map" />
             </label>
@@ -2707,6 +3589,268 @@ watch(
             </label>
           </div>
           <button class="primary-btn" type="button" @click="applyListFilters">Apply filters</button>
+        </article>
+
+        <article v-else-if="leftRailTab === 'reports'" class="block report-block">
+          <div class="section-head">
+            <div>
+              <h3>Inspection reports</h3>
+              <p class="muted section-copy">Live snapshot of the currently filtered inspection set.</p>
+            </div>
+            <div class="action-row report-head-actions">
+              <button class="ghost-btn small-btn" type="button" :disabled="appBusy || mapBusy || reportExportBusy" @click="refreshDashboard">
+                {{ appBusy || mapBusy ? "Refreshing..." : "Refresh" }}
+              </button>
+              <button
+                class="ghost-btn small-btn"
+                type="button"
+                :disabled="appBusy || mapBusy || reportExportBusy || reportMetrics.total === 0"
+                @click="exportReportCsv"
+              >
+                CSV
+              </button>
+              <button
+                class="ghost-btn small-btn"
+                type="button"
+                :disabled="appBusy || mapBusy || reportExportBusy || reportMetrics.total === 0"
+                @click="exportReportJson"
+              >
+                JSON
+              </button>
+              <button
+                class="ghost-btn small-btn"
+                type="button"
+                :disabled="appBusy || mapBusy || reportExportBusy || reportMetrics.total === 0"
+                @click="exportReportPdf"
+              >
+                PDF
+              </button>
+            </div>
+          </div>
+
+          <div v-if="mapBusy && mapInspections.length === 0" class="empty">Loading report...</div>
+          <template v-else-if="reportMetrics.total === 0">
+            <div class="empty">No inspections available in the current filter set.</div>
+          </template>
+          <template v-else>
+            <div v-if="activeFilterSummary.length > 0" class="filter-pill-row">
+              <span v-for="token in activeFilterSummary" :key="token" class="filter-pill">{{ token }}</span>
+            </div>
+
+            <div class="report-kpi-grid">
+              <article class="report-kpi">
+                <span>Total inspections</span>
+                <strong>{{ reportMetrics.total }}</strong>
+                <p class="muted">{{ reportMetrics.open }} open | {{ reportMetrics.closed }} closed</p>
+              </article>
+              <article class="report-kpi">
+                <span>Compliance</span>
+                <strong>{{ reportMetrics.passRate }}% pass</strong>
+                <p class="muted">{{ reportMetrics.failRate }}% fail | {{ reportMetrics.na }} N/A</p>
+              </article>
+              <article class="report-kpi">
+                <span>Map + media coverage</span>
+                <strong>{{ reportMetrics.mappedRate }}% mapped</strong>
+                <p class="muted">{{ reportMetrics.mediaCoverage }}% with uploaded media</p>
+              </article>
+              <article class="report-kpi">
+                <span>Evidence volume</span>
+                <strong>{{ reportMetrics.totalMedia }} file(s)</strong>
+                <p class="muted">Average {{ reportMetrics.avgMedia }} file(s) per inspection</p>
+              </article>
+              <article class="report-kpi">
+                <span>Geometry mix</span>
+                <strong>{{ reportMetrics.pointGeometry }} points</strong>
+                <p class="muted">{{ reportMetrics.areaGeometry }} areas</p>
+              </article>
+            </div>
+
+            <div class="report-grid-two">
+              <article class="report-card">
+                <div class="section-head compact-head">
+                  <h4>Status distribution</h4>
+                  <span class="muted">{{ reportMetrics.total }} total</span>
+                </div>
+                <ul class="report-bars">
+                  <li v-for="status in reportStatusDistribution" :key="status.key">
+                    <div class="report-bar-head">
+                      <span>{{ status.label }}</span>
+                      <strong>{{ status.value }} <small>{{ status.percent }}%</small></strong>
+                    </div>
+                    <div class="report-bar-track">
+                      <span class="report-bar-fill status-fill" :style="{ width: `${status.percent}%` }" />
+                    </div>
+                  </li>
+                </ul>
+              </article>
+
+              <article class="report-card">
+                <div class="section-head compact-head">
+                  <h4>Result distribution</h4>
+                  <span class="muted">Checklist outcomes</span>
+                </div>
+                <ul class="report-bars">
+                  <li v-for="result in reportResultDistribution" :key="result.key">
+                    <div class="report-bar-head">
+                      <span>{{ result.label }}</span>
+                      <strong>{{ result.value }} <small>{{ result.percent }}%</small></strong>
+                    </div>
+                    <div class="report-bar-track">
+                      <span :class="['report-bar-fill', `result-fill-${result.key}`]" :style="{ width: `${result.percent}%` }" />
+                    </div>
+                  </li>
+                </ul>
+              </article>
+            </div>
+
+            <article class="report-card">
+              <div class="section-head compact-head">
+                <div>
+                  <h4>Update trend</h4>
+                  <p class="muted">Inspection updates over the last {{ reportTrendSeries.length }} days.</p>
+                </div>
+              </div>
+              <ul class="report-bars trend-bars">
+                <li v-for="day in reportTrendSeries" :key="day.key">
+                  <div class="report-bar-head">
+                    <span>{{ day.label }}</span>
+                    <strong>{{ day.total }}</strong>
+                  </div>
+                  <div class="report-bar-track">
+                    <span class="report-bar-fill trend-fill" :style="{ width: `${day.percent}%` }" />
+                  </div>
+                  <p class="muted report-bar-subtext">Pass {{ day.pass }} | Fail {{ day.fail }} | N/A {{ day.na }}</p>
+                </li>
+              </ul>
+            </article>
+
+            <article class="report-card">
+              <div class="section-head compact-head">
+                <h4>Operational details</h4>
+                <span class="muted">Current filter scope</span>
+              </div>
+              <div class="summary-grid report-insight-grid">
+                <div class="summary-item">
+                  <span>Review queue</span>
+                  <strong>{{ reportDetailInsights.reviewQueue }}</strong>
+                </div>
+                <div class="summary-item">
+                  <span>Stale open (>= {{ REPORT_STALE_DAYS }}d)</span>
+                  <strong>{{ reportDetailInsights.staleOpen }}</strong>
+                </div>
+                <div class="summary-item">
+                  <span>Critical markers</span>
+                  <strong>{{ reportDetailInsights.criticalMarkers }}</strong>
+                </div>
+                <div class="summary-item">
+                  <span>With photos</span>
+                  <strong>{{ reportDetailInsights.withPhotos }}</strong>
+                </div>
+                <div class="summary-item">
+                  <span>With documents</span>
+                  <strong>{{ reportDetailInsights.withDocuments }}</strong>
+                </div>
+                <div class="summary-item">
+                  <span>Without map location</span>
+                  <strong>{{ reportDetailInsights.withoutLocation }}</strong>
+                </div>
+              </div>
+            </article>
+
+            <article class="report-card">
+              <div class="section-head compact-head">
+                <h4>Team summary</h4>
+                <span class="muted">{{ reportTeamBreakdown.length }} team(s)</span>
+              </div>
+              <div class="table-wrap">
+                <table class="report-table">
+                  <thead>
+                    <tr>
+                      <th>Team</th>
+                      <th>Total</th>
+                      <th>Open</th>
+                      <th>Pass</th>
+                      <th>Fail</th>
+                      <th>Media</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="team in reportTeamBreakdown" :key="team.key">
+                      <td>{{ team.label }}</td>
+                      <td>{{ team.total }}</td>
+                      <td>{{ team.open }}</td>
+                      <td>{{ team.pass }} ({{ team.passRate }}%)</td>
+                      <td>{{ team.fail }} ({{ team.failRate }}%)</td>
+                      <td>{{ team.withMedia }} ({{ team.mediaCoverage }}%)</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="report-card">
+              <div class="section-head compact-head">
+                <h4>Inspection register</h4>
+                <span class="muted">{{ reportInspectionRows.length }} record(s)</span>
+              </div>
+              <div class="table-wrap report-table-wrap">
+                <table class="report-table report-inspection-table">
+                  <thead>
+                    <tr>
+                      <th>Inspection</th>
+                      <th>Site</th>
+                      <th>Team</th>
+                      <th>Assignee</th>
+                      <th>Status</th>
+                      <th>Result</th>
+                      <th>Marker</th>
+                      <th>Geometry</th>
+                      <th>Location</th>
+                      <th>Media</th>
+                      <th>Created</th>
+                      <th>Updated</th>
+                      <th>Age</th>
+                      <th>Details</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="inspection in reportInspectionRows" :key="inspection.id">
+                      <td>
+                        <button class="link-btn" type="button" @click="openInspectionFromList(inspection.id)">
+                          {{ inspection.inspection_no }}
+                        </button>
+                      </td>
+                      <td>{{ inspection.site_name }}</td>
+                      <td>{{ teamLabel(inspection.team_id) }}</td>
+                      <td>{{ userLabel(inspection.assigned_to) }}</td>
+                      <td><span :class="statusChipClass(inspection.status)">{{ inspection.status }}</span></td>
+                      <td><span :class="resultChipClass(inspection.overall_result)">{{ inspection.overall_result || "na" }}</span></td>
+                      <td>{{ markerTypeLabel(inspection.marker_type) }}</td>
+                      <td>{{ geometryTypeLabel(inspection.geometry_type) }}</td>
+                      <td>{{ coordinateLabel(inspection.latitude, inspection.longitude) }}</td>
+                      <td>
+                        {{ inspection.media_count || 0 }}
+                        <span class="muted report-cell-subtext">
+                          P {{ inspection.media_photo_count || 0 }} / D {{ inspection.media_document_count || 0 }}
+                        </span>
+                      </td>
+                      <td>{{ formatDate(inspection.created_at) }}</td>
+                      <td>{{ formatDate(inspection.updated_at) }}</td>
+                      <td>{{ updatedAgeLabel(inspection.updated_at) }}</td>
+                      <td>
+                        <details class="report-inline-details">
+                          <summary>View</summary>
+                          <p class="muted">Creator: {{ userLabel(inspection.created_by) }}</p>
+                          <p class="muted">Cover media: {{ inspection.media_cover_file_name || "-" }}</p>
+                          <p>{{ inspection.notes || "No notes" }}</p>
+                        </details>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </article>
+          </template>
         </article>
 
         <article v-else-if="leftRailTab === 'admin' && isAdminUser" class="block">
@@ -3197,12 +4341,15 @@ watch(
           :selected-inspection-id="selectedInspectionId"
           :map-only-active="mapExpanded"
           :busy="appBusy || inspectionBusy || mapBusy"
+          :api-base="API_BASE"
+          :auth-token="authToken"
           :create-placement-active="createPlacementActive"
           :create-placement-kind="createPlacementKind"
           :create-inspection-draft="{
             latitude: newInspectionForm.latitude,
             longitude: newInspectionForm.longitude,
             geometry: createGeometryDraft,
+            marker_type: newInspectionForm.marker_type,
           }"
           @select-inspection="selectInspection"
           @save-inspection-geometry="saveInspectionGeometry"
@@ -3313,10 +4460,53 @@ watch(
 
           <article v-if="activeTab === 'overview'" class="block">
             <div class="section-head">
-              <h3>Notes and location</h3>
+              <h3>Inspection details</h3>
               <p class="muted">Updated {{ formatDate(selectedInspection?.updated_at) }}</p>
             </div>
             <div class="form-grid compact-grid">
+              <label class="span-2">
+                Site name
+                <input
+                  v-model.trim="inspectionDetailsDraft.site_name"
+                  :disabled="!hasSupervisorPrivileges || !canPatchInspection || notesBusy"
+                  placeholder="Warehouse A"
+                />
+              </label>
+              <label>
+                Team
+                <select
+                  v-model="inspectionDetailsDraft.team_id"
+                  :disabled="!hasSupervisorPrivileges || !canPatchInspection || notesBusy"
+                >
+                  <option value="" disabled>Select team</option>
+                  <option v-for="team in teamDirectory" :key="team.id" :value="String(team.id)">
+                    {{ team.label || team.name || `Field Team ${team.id}` }}
+                  </option>
+                </select>
+              </label>
+              <label>
+                Assigned to
+                <select
+                  v-model="inspectionDetailsDraft.assigned_to"
+                  :disabled="!hasSupervisorPrivileges || !canPatchInspection || notesBusy"
+                >
+                  <option value="" disabled>Select assignee</option>
+                  <option v-for="user in detailAssignableUsers" :key="user.id" :value="String(user.id)">
+                    {{ user.full_name || user.username }} ({{ user.username }})
+                  </option>
+                </select>
+              </label>
+              <label>
+                Marker type
+                <select
+                  v-model="inspectionDetailsDraft.marker_type"
+                  :disabled="!canPatchInspection || notesBusy"
+                >
+                  <option v-for="option in MARKER_TYPE_OPTIONS" :key="option.value" :value="option.value">
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
               <label>
                 Latitude
                 <input
@@ -3349,7 +4539,7 @@ watch(
               class="primary-btn"
               type="button"
               :disabled="!canPatchInspection || notesBusy"
-              @click="saveInspectionNotes"
+              @click="saveInspectionDetails"
             >
               {{ notesBusy ? "Saving..." : "Save details" }}
             </button>
@@ -4299,6 +5489,183 @@ button:disabled {
   min-height: 280px;
 }
 
+.report-block {
+  display: grid;
+  gap: 10px;
+}
+
+.report-head-actions {
+  justify-content: flex-end;
+}
+
+.report-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.report-kpi {
+  border: 1px solid #35546d;
+  border-radius: 11px;
+  background: #102739;
+  padding: 8px;
+  display: grid;
+  gap: 4px;
+}
+
+.report-kpi span {
+  color: var(--ink-soft);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.report-kpi strong {
+  font-size: 1rem;
+}
+
+.report-insight-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.report-grid-two {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.report-card {
+  border: 1px solid #35546d;
+  border-radius: 12px;
+  background: #102739;
+  padding: 9px;
+  display: grid;
+  gap: 8px;
+}
+
+.report-bars {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.report-bar-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.report-bar-head strong {
+  font-size: 0.84rem;
+}
+
+.report-bar-head small {
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+  margin-left: 4px;
+}
+
+.report-bar-track {
+  height: 9px;
+  border-radius: 999px;
+  border: 1px solid #2e4c64;
+  background: #0f2434;
+  overflow: hidden;
+}
+
+.report-bar-fill {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: inherit;
+}
+
+.status-fill {
+  background: linear-gradient(90deg, #2c9eb2, #1b5f7f);
+}
+
+.result-fill-pass {
+  background: linear-gradient(90deg, #2e8e5f, #1e6b44);
+}
+
+.result-fill-fail {
+  background: linear-gradient(90deg, #c27070, #8a4747);
+}
+
+.result-fill-na {
+  background: linear-gradient(90deg, #5e7890, #44596b);
+}
+
+.trend-fill {
+  background: linear-gradient(90deg, #5ca7d2, #2c6b95);
+}
+
+.report-bar-subtext {
+  font-size: 0.74rem;
+}
+
+.trend-bars li {
+  border-bottom: 1px solid #223f54;
+  padding-bottom: 6px;
+}
+
+.trend-bars li:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.report-table {
+  min-width: 560px;
+}
+
+.report-table-wrap {
+  max-height: min(44vh, 420px);
+}
+
+.report-inspection-table {
+  min-width: 1500px;
+}
+
+.report-cell-subtext {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.72rem;
+}
+
+.report-inline-details summary {
+  cursor: pointer;
+  color: #b5d9ea;
+  font-size: 0.78rem;
+}
+
+.report-inline-details p {
+  margin-top: 4px;
+  font-size: 0.78rem;
+}
+
+.link-btn {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #9bdcf1;
+  padding: 0.15rem 0.1rem;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-size: 0.82rem;
+}
+
+.link-btn:hover:not(:disabled) {
+  transform: none;
+  color: #c8f2ff;
+}
+
+.link-btn:focus-visible {
+  outline: 2px solid rgba(60, 182, 201, 0.5);
+}
+
 .filter-pill-row {
   display: flex;
   flex-wrap: wrap;
@@ -4550,6 +5917,14 @@ th {
   .tab-strip {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+
+  .report-grid-two {
+    grid-template-columns: 1fr;
+  }
+
+  .report-insight-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 980px) {
@@ -4671,6 +6046,14 @@ th {
 
   .mini-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .report-kpi-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .report-insight-grid {
+    grid-template-columns: 1fr;
   }
 
   .span-2 {

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, "..");
+const defaultWebDistDir = path.resolve(rootDir, "..", "dist");
 
 function parsePort(value, fallback) {
   const parsed = Number.parseInt(value, 10);
@@ -61,11 +62,22 @@ function parseAllowedOrigins(rawValue) {
   return Array.from(new Set(normalized));
 }
 
+function resolveOptionalPath(rootDirValue, rawValue) {
+  if (typeof rawValue !== "string") return null;
+  const trimmed = rawValue.trim();
+  if (!trimmed) return null;
+  return path.isAbsolute(trimmed) ? trimmed : path.resolve(rootDirValue, trimmed);
+}
+
 export const config = {
   rootDir,
   host: process.env.HOST || "0.0.0.0",
   port: parsePort(process.env.PORT, 8787),
   dataDir: process.env.OGIS_DATA_DIR || path.resolve(rootDir, "data"),
+  webDistDir:
+    process.env.OGIS_WEB_DIST_DIR === undefined
+      ? defaultWebDistDir
+      : resolveOptionalPath(rootDir, process.env.OGIS_WEB_DIST_DIR),
   sessionTtlHours: parsePositiveInt(process.env.OGIS_SESSION_TTL_HOURS, 12),
   allowDebugHeaderAuth: parseBoolean(process.env.OGIS_ALLOW_DEBUG_HEADER_AUTH, false),
   loginRateLimitWindowMs: parsePositiveInt(process.env.OGIS_LOGIN_RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
@@ -90,6 +102,10 @@ export const config = {
     "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
   permissionsPolicy:
     process.env.OGIS_PERMISSIONS_POLICY || "camera=(), microphone=(), geolocation=()",
+  tlsCertFile: resolveOptionalPath(rootDir, process.env.OGIS_TLS_CERT_FILE),
+  tlsKeyFile: resolveOptionalPath(rootDir, process.env.OGIS_TLS_KEY_FILE),
+  tlsCaFile: resolveOptionalPath(rootDir, process.env.OGIS_TLS_CA_FILE),
+  tlsPassphrase: process.env.OGIS_TLS_PASSPHRASE,
 };
 
 config.dbFile = process.env.OGIS_DB_FILE || path.resolve(config.dataDir, "ogis-local.sqlite");

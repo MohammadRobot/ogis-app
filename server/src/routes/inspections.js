@@ -41,6 +41,8 @@ const DEFAULT_PERF_RECENT_LIMIT = 10;
 const MAX_PERF_RECENT_LIMIT = 50;
 const VALID_INSPECTION_GEOMETRY_TYPES = new Set(["point", "area"]);
 const VALID_MASTER_OVERLAY_KINDS = new Set(["zone", "label"]);
+const DEFAULT_MARKER_TYPE = "standard";
+const VALID_MARKER_TYPES = new Set(["standard", "info", "warning", "critical"]);
 const VALID_TIMELINE_CATEGORIES = new Set([
   "lifecycle",
   "status",
@@ -54,6 +56,13 @@ function normalizeNullableText(value) {
   if (value == null) return null;
   const text = String(value).trim();
   return text.length > 0 ? text : null;
+}
+
+function normalizeMarkerType(value) {
+  const text = normalizeNullableText(value);
+  if (text == null) return null;
+  const normalized = text.toLowerCase();
+  return VALID_MARKER_TYPES.has(normalized) ? normalized : undefined;
 }
 
 function parseInteger(value) {
@@ -483,6 +492,7 @@ function buildSelectInspectionByIdQuery() {
       overall_result,
       latitude,
       longitude,
+      marker_type,
       geometry_type,
       geometry_json,
       notes,
@@ -631,6 +641,7 @@ function normalizeInspectionMapRow(row) {
       : geometry
         ? "area"
         : null;
+  const markerType = normalizeMarkerType(row.marker_type);
 
   return {
     id: row.id,
@@ -643,19 +654,30 @@ function normalizeInspectionMapRow(row) {
     overall_result: row.overall_result,
     latitude: row.latitude,
     longitude: row.longitude,
+    marker_type: markerType ?? DEFAULT_MARKER_TYPE,
     geometry_type: geometryType,
     geometry,
     notes: row.notes ?? null,
+    media_count: Number(row.media_count) || 0,
+    media_photo_count: Number(row.media_photo_count) || 0,
+    media_document_count: Number(row.media_document_count) || 0,
+    media_cover_media_id: Number.isFinite(Number(row.media_cover_media_id))
+      ? Number(row.media_cover_media_id)
+      : null,
+    media_cover_file_name: row.media_cover_file_name ?? null,
+    created_at: row.created_at,
     updated_at: row.updated_at,
   };
 }
 
 function normalizeMasterOverlayRow(row) {
+  const markerType = normalizeMarkerType(row.marker_type);
   return {
     id: row.id,
     kind: row.kind,
     title: row.title ?? null,
     label_text: row.label_text ?? null,
+    marker_type: markerType ?? DEFAULT_MARKER_TYPE,
     geometry: parseGeometryJson(row.geometry_json),
     latitude: row.latitude,
     longitude: row.longitude,
@@ -1465,6 +1487,7 @@ function buildListQuerySql(query) {
       inspections.overall_result,
       inspections.latitude,
       inspections.longitude,
+      inspections.marker_type,
       inspections.geometry_type,
       inspections.geometry_json,
       inspections.notes,
@@ -1667,11 +1690,38 @@ router.get("/map", requireUser, requirePasswordChangeCompleted, (req, res) => {
         inspections.overall_result,
         inspections.latitude,
         inspections.longitude,
+        inspections.marker_type,
         inspections.geometry_type,
         inspections.geometry_json,
         inspections.notes,
+        COALESCE(media_summary.media_count, 0) AS media_count,
+        COALESCE(media_summary.media_photo_count, 0) AS media_photo_count,
+        COALESCE(media_summary.media_document_count, 0) AS media_document_count,
+        media_summary.media_cover_media_id,
+        media_summary.media_cover_file_name,
+        inspections.created_at,
         inspections.updated_at
       FROM inspections
+      LEFT JOIN (
+        SELECT
+          summary.inspection_id,
+          summary.media_count,
+          summary.media_photo_count,
+          summary.media_document_count,
+          summary.media_cover_media_id,
+          COALESCE(cover.original_file_name, cover.stored_file_name) AS media_cover_file_name
+        FROM (
+          SELECT
+            inspection_id,
+            COUNT(*) AS media_count,
+            SUM(CASE WHEN media_type = 'photo' THEN 1 ELSE 0 END) AS media_photo_count,
+            SUM(CASE WHEN media_type = 'document' THEN 1 ELSE 0 END) AS media_document_count,
+            MAX(CASE WHEN media_type = 'photo' THEN id ELSE NULL END) AS media_cover_media_id
+          FROM media_files
+          GROUP BY inspection_id
+        ) summary
+        LEFT JOIN media_files cover ON cover.id = summary.media_cover_media_id
+      ) media_summary ON media_summary.inspection_id = inspections.id
       ${query.whereSql}
       ORDER BY inspections.site_name ASC, inspections.id ASC
       `
@@ -1716,11 +1766,38 @@ router.get("/master-map", requireUser, requirePasswordChangeCompleted, (req, res
         inspections.overall_result,
         inspections.latitude,
         inspections.longitude,
+        inspections.marker_type,
         inspections.geometry_type,
         inspections.geometry_json,
         inspections.notes,
+        COALESCE(media_summary.media_count, 0) AS media_count,
+        COALESCE(media_summary.media_photo_count, 0) AS media_photo_count,
+        COALESCE(media_summary.media_document_count, 0) AS media_document_count,
+        media_summary.media_cover_media_id,
+        media_summary.media_cover_file_name,
+        inspections.created_at,
         inspections.updated_at
       FROM inspections
+      LEFT JOIN (
+        SELECT
+          summary.inspection_id,
+          summary.media_count,
+          summary.media_photo_count,
+          summary.media_document_count,
+          summary.media_cover_media_id,
+          COALESCE(cover.original_file_name, cover.stored_file_name) AS media_cover_file_name
+        FROM (
+          SELECT
+            inspection_id,
+            COUNT(*) AS media_count,
+            SUM(CASE WHEN media_type = 'photo' THEN 1 ELSE 0 END) AS media_photo_count,
+            SUM(CASE WHEN media_type = 'document' THEN 1 ELSE 0 END) AS media_document_count,
+            MAX(CASE WHEN media_type = 'photo' THEN id ELSE NULL END) AS media_cover_media_id
+          FROM media_files
+          GROUP BY inspection_id
+        ) summary
+        LEFT JOIN media_files cover ON cover.id = summary.media_cover_media_id
+      ) media_summary ON media_summary.inspection_id = inspections.id
       ${query.whereSql}
       ORDER BY inspections.site_name ASC, inspections.id ASC
       `
@@ -1736,6 +1813,7 @@ router.get("/master-map", requireUser, requirePasswordChangeCompleted, (req, res
         kind,
         title,
         label_text,
+        marker_type,
         geometry_json,
         latitude,
         longitude,
@@ -1786,6 +1864,15 @@ router.post(
 
     const title = normalizeNullableText(req.body?.title);
     const labelText = normalizeNullableText(req.body?.label_text);
+    const parsedMarkerType = normalizeMarkerType(req.body?.marker_type);
+    if (parsedMarkerType === undefined) {
+      res.status(400).json({
+        error: "Invalid request",
+        message: `marker_type must be one of: ${Array.from(VALID_MARKER_TYPES).join(", ")}`,
+      });
+      return;
+    }
+    const markerType = parsedMarkerType ?? DEFAULT_MARKER_TYPE;
 
     let latitude = null;
     let longitude = null;
@@ -1832,15 +1919,16 @@ router.post(
           kind,
           title,
           label_text,
+          marker_type,
           geometry_json,
           latitude,
           longitude,
           created_by
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `
       )
-      .run(kind, title, labelText, geometryJson, latitude, longitude, req.user.id);
+      .run(kind, title, labelText, markerType, geometryJson, latitude, longitude, req.user.id);
 
     const created = db
       .prepare(
@@ -1850,6 +1938,7 @@ router.post(
           kind,
           title,
           label_text,
+          marker_type,
           geometry_json,
           latitude,
           longitude,
@@ -1873,6 +1962,7 @@ router.post(
         kind: created.kind,
         title: created.title,
         label_text: created.label_text,
+        marker_type: created.marker_type ?? DEFAULT_MARKER_TYPE,
       }
     );
 
@@ -1904,6 +1994,7 @@ router.patch(
           kind,
           title,
           label_text,
+          marker_type,
           geometry_json,
           latitude,
           longitude,
@@ -1927,12 +2018,26 @@ router.patch(
     const hasLatitude = Object.prototype.hasOwnProperty.call(req.body || {}, "latitude");
     const hasLongitude = Object.prototype.hasOwnProperty.call(req.body || {}, "longitude");
     const hasGeometry = Object.prototype.hasOwnProperty.call(req.body || {}, "geometry");
+    const hasMarkerType = Object.prototype.hasOwnProperty.call(req.body || {}, "marker_type");
 
     let nextTitle = hasTitle ? normalizeNullableText(req.body?.title) : existing.title;
     let nextLabelText = hasLabelText ? normalizeNullableText(req.body?.label_text) : existing.label_text;
     let nextLatitude = hasLatitude ? parseCoordinate(req.body?.latitude, -90, 90) : existing.latitude;
     let nextLongitude = hasLongitude ? parseCoordinate(req.body?.longitude, -180, 180) : existing.longitude;
     let nextGeometryJson = existing.geometry_json;
+    let nextMarkerType = normalizeMarkerType(existing.marker_type) ?? DEFAULT_MARKER_TYPE;
+
+    if (hasMarkerType) {
+      const parsedMarkerType = normalizeMarkerType(req.body?.marker_type);
+      if (parsedMarkerType === undefined) {
+        res.status(400).json({
+          error: "Invalid request",
+          message: `marker_type must be one of: ${Array.from(VALID_MARKER_TYPES).join(", ")}`,
+        });
+        return;
+      }
+      nextMarkerType = parsedMarkerType ?? DEFAULT_MARKER_TYPE;
+    }
 
     if (existing.kind === "zone") {
       if (hasGeometry) {
@@ -1990,13 +2095,22 @@ router.patch(
       SET
         title = ?,
         label_text = ?,
+        marker_type = ?,
         geometry_json = ?,
         latitude = ?,
         longitude = ?,
         updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
       `
-    ).run(nextTitle, nextLabelText, nextGeometryJson, nextLatitude, nextLongitude, overlayId);
+    ).run(
+      nextTitle,
+      nextLabelText,
+      nextMarkerType,
+      nextGeometryJson,
+      nextLatitude,
+      nextLongitude,
+      overlayId
+    );
 
     const updated = db
       .prepare(
@@ -2006,6 +2120,7 @@ router.patch(
           kind,
           title,
           label_text,
+          marker_type,
           geometry_json,
           latitude,
           longitude,
@@ -2027,6 +2142,7 @@ router.patch(
       overlayId,
       {
         kind: existing.kind,
+        marker_type: nextMarkerType,
       }
     );
 
@@ -2463,6 +2579,16 @@ router.post(
     const longitudeInput = parseCoordinate(req.body?.longitude, -180, 180);
     const geometryPayload = req.body?.geometry ?? req.body?.geometry_json;
     const notes = normalizeNullableText(req.body?.notes);
+    const parsedMarkerType = normalizeMarkerType(req.body?.marker_type);
+
+    if (parsedMarkerType === undefined) {
+      res.status(400).json({
+        error: "Invalid request",
+        message: `marker_type must be one of: ${Array.from(VALID_MARKER_TYPES).join(", ")}`,
+      });
+      return;
+    }
+    const markerType = parsedMarkerType ?? DEFAULT_MARKER_TYPE;
 
     let latitude = latitudeInput;
     let longitude = longitudeInput;
@@ -2547,11 +2673,12 @@ router.post(
         overall_result,
         latitude,
         longitude,
+        marker_type,
         geometry_type,
         geometry_json,
         notes
       )
-      VALUES (?, ?, ?, ?, ?, 'draft', 'na', ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, 'draft', 'na', ?, ?, ?, ?, ?, ?)
       `
     );
 
@@ -2567,6 +2694,7 @@ router.post(
             req.user.id,
             latitude,
             longitude,
+            markerType,
             geometryType,
             geometryJson,
             notes
@@ -2580,6 +2708,7 @@ router.post(
             assigned_to: assignedTo,
             latitude,
             longitude,
+            marker_type: markerType,
             geometry_type: geometryType,
             seeded_checklist_items: seededCount,
           });
@@ -3584,14 +3713,21 @@ router.patch(
   (req, res) => {
     const db = req.app.locals.db;
     const previous = req.inspection;
+    const hasSiteName = Object.prototype.hasOwnProperty.call(req.body || {}, "site_name");
+    const hasTeamId = Object.prototype.hasOwnProperty.call(req.body || {}, "team_id");
+    const hasAssignedTo = Object.prototype.hasOwnProperty.call(req.body || {}, "assigned_to");
     const nextStatus = typeof req.body?.status === "string" ? req.body.status : previous.status;
     const nextNotes = typeof req.body?.notes === "string" ? req.body.notes : previous.notes;
+    const nextSiteName = hasSiteName ? normalizeNullableText(req.body?.site_name) : previous.site_name;
+    const nextTeamId = hasTeamId ? parseInteger(req.body?.team_id) : previous.team_id;
+    const nextAssignedTo = hasAssignedTo ? parseInteger(req.body?.assigned_to) : previous.assigned_to;
 
     const hasLatitude = Object.prototype.hasOwnProperty.call(req.body || {}, "latitude");
     const hasLongitude = Object.prototype.hasOwnProperty.call(req.body || {}, "longitude");
     const hasGeometry =
       Object.prototype.hasOwnProperty.call(req.body || {}, "geometry") ||
       Object.prototype.hasOwnProperty.call(req.body || {}, "geometry_json");
+    const hasMarkerType = Object.prototype.hasOwnProperty.call(req.body || {}, "marker_type");
 
     const parsedLatitude = hasLatitude ? parseCoordinate(req.body?.latitude, -90, 90) : previous.latitude;
     const parsedLongitude = hasLongitude
@@ -3604,6 +3740,91 @@ router.patch(
         message: "latitude must be between -90 and 90, longitude must be between -180 and 180",
       });
       return;
+    }
+
+    const parsedMarkerType = hasMarkerType
+      ? normalizeMarkerType(req.body?.marker_type)
+      : normalizeMarkerType(previous.marker_type);
+    if (parsedMarkerType === undefined) {
+      res.status(400).json({
+        error: "Invalid request",
+        message: `marker_type must be one of: ${Array.from(VALID_MARKER_TYPES).join(", ")}`,
+      });
+      return;
+    }
+    const nextMarkerType = parsedMarkerType ?? DEFAULT_MARKER_TYPE;
+
+    if (!nextSiteName) {
+      res.status(400).json({
+        error: "Invalid request",
+        message: "site_name must be a non-empty string",
+      });
+      return;
+    }
+
+    if ((hasTeamId && nextTeamId == null) || (hasAssignedTo && nextAssignedTo == null)) {
+      res.status(400).json({
+        error: "Invalid request",
+        message: "team_id and assigned_to must be integers",
+      });
+      return;
+    }
+
+    if (!Number.isFinite(nextTeamId) || !Number.isFinite(nextAssignedTo)) {
+      res.status(400).json({
+        error: "Invalid request",
+        message: "Inspection must include valid team_id and assigned_to",
+      });
+      return;
+    }
+
+    if (tableExists(db, "teams")) {
+      const team = db
+        .prepare(
+          `
+          SELECT id
+          FROM teams
+          WHERE id = ?
+          LIMIT 1
+          `
+        )
+        .get(nextTeamId);
+      if (!team) {
+        res.status(400).json({
+          error: "Invalid request",
+          message: "team_id not found",
+        });
+        return;
+      }
+    }
+
+    if (hasTeamId || hasAssignedTo) {
+      const assignedUser = db
+        .prepare(
+          `
+          SELECT id, team_id
+          FROM users
+          WHERE id = ?
+          LIMIT 1
+          `
+        )
+        .get(nextAssignedTo);
+
+      if (!assignedUser) {
+        res.status(400).json({
+          error: "Invalid request",
+          message: "assigned_to user not found",
+        });
+        return;
+      }
+
+      if (assignedUser.team_id !== nextTeamId) {
+        res.status(400).json({
+          error: "Invalid request",
+          message: "assigned_to must belong to the same team_id",
+        });
+        return;
+      }
     }
 
     if (nextStatus !== previous.status) {
@@ -3668,20 +3889,28 @@ router.patch(
       `
       UPDATE inspections
       SET
+        site_name = ?,
+        team_id = ?,
+        assigned_to = ?,
         status = ?,
         notes = ?,
         latitude = ?,
         longitude = ?,
+        marker_type = ?,
         geometry_type = ?,
         geometry_json = ?,
         updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
       `
     ).run(
+      nextSiteName,
+      nextTeamId,
+      nextAssignedTo,
       nextStatus,
       nextNotes,
       nextLatitude,
       nextLongitude,
+      nextMarkerType,
       nextGeometryType,
       nextGeometryJson,
       previous.id
@@ -3691,17 +3920,25 @@ router.patch(
 
     writeAuditLog(db, req.user.id, "inspection.updated", "inspections", previous.id, {
       before: {
+        site_name: previous.site_name,
+        team_id: previous.team_id,
+        assigned_to: previous.assigned_to,
         status: previous.status,
         notes: previous.notes,
         latitude: previous.latitude,
         longitude: previous.longitude,
+        marker_type: normalizeMarkerType(previous.marker_type) ?? DEFAULT_MARKER_TYPE,
         geometry_type: previous.geometry_type ?? null,
       },
       after: {
+        site_name: updated.site_name,
+        team_id: updated.team_id,
+        assigned_to: updated.assigned_to,
         status: updated.status,
         notes: updated.notes,
         latitude: updated.latitude,
         longitude: updated.longitude,
+        marker_type: normalizeMarkerType(updated.marker_type) ?? DEFAULT_MARKER_TYPE,
         geometry_type: updated.geometry_type ?? null,
       },
     });

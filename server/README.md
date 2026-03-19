@@ -21,6 +21,76 @@ npm run dev
 
 Default URL: `http://0.0.0.0:8787`
 
+## HTTPS (Optional Native TLS)
+
+Backend can run HTTPS directly when both TLS files are set:
+
+```bash
+export HOST=0.0.0.0
+export PORT=8443
+export OGIS_TLS_CERT_FILE=/etc/ssl/ogis/fullchain.pem
+export OGIS_TLS_KEY_FILE=/etc/ssl/ogis/privkey.pem
+npm run start
+```
+
+Generate a self-signed cert (local/testing only):
+
+```bash
+cd /path/to/ogis-app
+mkdir -p server/certs
+
+cat > server/certs/openssl-san.cnf <<'EOF'
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+C = AE
+ST = Dubai
+L = Dubai
+O = OGIS Local
+OU = Dev
+CN = localhost
+
+[v3_req]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+
+[alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+EOF
+
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout server/certs/selfsigned-key.pem \
+  -out server/certs/selfsigned-cert.pem \
+  -config server/certs/openssl-san.cnf
+
+chmod 600 server/certs/selfsigned-key.pem
+```
+
+Optional:
+
+- `OGIS_TLS_CA_FILE` (CA chain file)
+- `OGIS_TLS_PASSPHRASE` (private key passphrase)
+
+If only one of `OGIS_TLS_CERT_FILE` or `OGIS_TLS_KEY_FILE` is set, startup fails.
+
+## Serve Frontend (Optional)
+
+Backend can serve the built SPA directly (single-service deployment).
+
+- Default frontend directory: `<repo>/dist`
+- Override with `OGIS_WEB_DIST_DIR=/absolute/path/to/dist`
+- Disable frontend serving by setting `OGIS_WEB_DIST_DIR=` (empty)
+
 ## Auth Flow
 
 Use local login to get a Bearer token:

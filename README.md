@@ -51,6 +51,13 @@ cd /path/to/ogis-app
 npm run dev
 ```
 
+If backend is running on HTTPS `:8443`, run frontend dev with proxy env vars:
+
+```bash
+cd /path/to/ogis-app
+VITE_API_PROXY_TARGET=https://127.0.0.1:8443 VITE_API_PROXY_SECURE=0 npm run dev
+```
+
 Open:
 
 - Frontend: `http://localhost:5173`
@@ -76,6 +83,112 @@ Password change is required after first login.
 
 ## Production Build + Run
 
+### Quick Deploy (Single Service)
+
+This project now supports running frontend + backend from one backend process.
+
+Run:
+
+```bash
+cd /path/to/ogis-app
+./scripts/deploy.sh
+```
+
+With systemd + HTTPS:
+
+```bash
+cd /path/to/ogis-app
+INSTALL_SYSTEMD=1 \
+OGIS_TLS_CERT_FILE=/etc/letsencrypt/live/your-domain/fullchain.pem \
+OGIS_TLS_KEY_FILE=/etc/letsencrypt/live/your-domain/privkey.pem \
+OGIS_CORS_ALLOWED_ORIGINS=https://your-domain:8443 \
+./scripts/deploy.sh
+```
+
+After deploy, app is served from backend on `http(s)://<server>:8443` by default.
+
+Notes:
+
+- Replace `your-domain` with your real domain.
+- Cert/key paths must exist; deploy script now validates them before starting service.
+- If you do not have TLS certs yet, run without `OGIS_TLS_CERT_FILE` and `OGIS_TLS_KEY_FILE` first (HTTP mode), then enable HTTPS later.
+
+Generate a self-signed cert for local testing:
+
+```bash
+cd /path/to/ogis-app
+mkdir -p server/certs
+
+cat > server/certs/openssl-san.cnf <<'EOF'
+[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+C = AE
+ST = Dubai
+L = Dubai
+O = OGIS Local
+OU = Dev
+CN = localhost
+
+[v3_req]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+
+[alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+EOF
+
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout server/certs/selfsigned-key.pem \
+  -out server/certs/selfsigned-cert.pem \
+  -config server/certs/openssl-san.cnf
+
+chmod 600 server/certs/selfsigned-key.pem
+```
+
+Deploy with the generated cert:
+
+```bash
+cd /path/to/ogis-app
+INSTALL_SYSTEMD=1 \
+OGIS_TLS_CERT_FILE=$PWD/server/certs/selfsigned-cert.pem \
+OGIS_TLS_KEY_FILE=$PWD/server/certs/selfsigned-key.pem \
+OGIS_CORS_ALLOWED_ORIGINS=https://localhost:8443 \
+./scripts/deploy.sh
+```
+
+For LAN access, add your server IP to both certificate SAN and `OGIS_CORS_ALLOWED_ORIGINS`.
+
+### Service Control (systemd)
+
+Stop backend service:
+
+```bash
+sudo systemctl stop ogis-backend
+```
+
+Check status:
+
+```bash
+systemctl status ogis-backend --no-pager
+```
+
+Disable auto-start on boot:
+
+```bash
+sudo systemctl disable ogis-backend
+```
+
 ### 1) Build frontend
 
 ```bash
@@ -98,7 +211,12 @@ Important backend environment variables:
 - `PORT` (default `8787`)
 - `OGIS_DATA_DIR` (default `server/data`)
 - `OGIS_DB_FILE` (default `<OGIS_DATA_DIR>/ogis-local.sqlite`)
+- `OGIS_WEB_DIST_DIR` (default `<repo>/dist`, served by backend if `index.html` exists)
 - `OGIS_CORS_ALLOWED_ORIGINS` (comma-separated origins)
+- `OGIS_TLS_CERT_FILE` (enable native HTTPS when set with key file)
+- `OGIS_TLS_KEY_FILE` (enable native HTTPS when set with cert file)
+- `OGIS_TLS_CA_FILE` (optional CA chain)
+- `OGIS_TLS_PASSPHRASE` (optional private key passphrase)
 
 ### 3) Serve `dist/` and proxy `/api` to backend
 
