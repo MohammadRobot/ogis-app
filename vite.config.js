@@ -27,6 +27,7 @@ export default defineConfig({
   plugins: [vue()],
 
   server: {
+    allowedHosts: ["gis.domain.com"],
     host,
     port,
     strictPort: true,
