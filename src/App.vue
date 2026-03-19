@@ -79,8 +79,37 @@ function dayKeyFromDate(value) {
   return `${year}-${month}-${day}`;
 }
 
+function normalizeDateInput(value) {
+  if (value == null) return null;
+  if (value instanceof Date || typeof value === "number") return value;
+  if (typeof value !== "string") return value;
+
+  const trimmed = value.trim();
+  if (!trimmed) return trimmed;
+
+  // SQLite CURRENT_TIMESTAMP is UTC but stored without timezone.
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) {
+    return `${trimmed.replace(" ", "T")}Z`;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(trimmed)) {
+    return `${trimmed}Z`;
+  }
+
+  return trimmed;
+}
+
+function parseDateValue(value) {
+  const normalized = normalizeDateInput(value);
+  if (normalized == null || normalized === "") return null;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function toDateTimestamp(value) {
-  const timestamp = new Date(value).getTime();
+  const parsed = parseDateValue(value);
+  if (!parsed) return 0;
+  const timestamp = parsed.getTime();
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
@@ -3069,8 +3098,8 @@ function refreshTimeline() {
 
 function formatDate(value) {
   if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
+  const date = parseDateValue(value);
+  if (!date) return value;
   return new Intl.DateTimeFormat("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
